@@ -7,6 +7,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { executeJob } from "./execution.mjs";
 import { standalone } from "./standalone.mjs";
 
+const capabilities = [
+  "playwright",
+  "chrome-devtools-mcp",
+  "restricted-browser-authoring",
+  "script-revisions-v1",
+];
+
 const help = `Aratame QA toolkit — local-first, no Aratame account required
 
 Standalone (file paths are relative to --project):
@@ -161,11 +168,7 @@ async function main() {
       const enrolled = await apiClient(server)("/enroll", {
         token: values.token,
         name: values.name || os.hostname(),
-        capabilities: [
-          "playwright",
-          "chrome-devtools-mcp",
-          "restricted-browser-authoring",
-        ],
+        capabilities,
       });
       if (typeof enrolled.token !== "string" || !enrolled.runner?.id)
         throw new Error("Invalid enrollment response");
@@ -234,8 +237,8 @@ async function main() {
   );
   while (!shutdown.signal.aborted) {
     try {
-      await api("/heartbeat", {}, shutdown.signal);
-      const { job } = await api("/claim", {}, shutdown.signal);
+      await api("/heartbeat", { capabilities }, shutdown.signal);
+      const { job } = await api("/claim", { capabilities }, shutdown.signal);
       if (!job) {
         if (values.once) {
           console.log("No queued run available.");

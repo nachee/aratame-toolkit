@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import { compileScenario, exploreCase } from "./exploration.mjs";
 
 export async function safePath(project, relative, createParents = false) {
@@ -114,6 +115,7 @@ export async function executeJob(config, job, api, signal) {
   const logs = [];
   const reviews = [];
   const results = [];
+  const scriptRevisions = new Map();
   const baseUrl = config.baseUrl || job.settings?.baseUrl;
   if (
     config.deploymentLabel !== undefined &&
@@ -127,6 +129,7 @@ export async function executeJob(config, job, api, signal) {
   const localReceipt = {
     runId: run.id,
     deploymentLabel: config.deploymentLabel?.trim() ?? null,
+    cloudDeploymentIdentity: run.deploymentIdentity ?? null,
     target: baseUrl || null,
     targetScope: "configured runner target; existing specs may override",
     cases: cases.map((item) => ({
@@ -241,15 +244,69 @@ export async function executeJob(config, job, api, signal) {
       if (generated) args.push("--config", await generatedConfig());
       else if (config.playwrightConfig)
         args.push("--config", await safePath(project, config.playwrightConfig));
-      const execution = await processRun(process.execPath, args, {
-        cwd: project,
-        signal,
-        timeout: config.testTimeoutMs || 180_000,
-        env: {
-          PLAYWRIGHT_JSON_OUTPUT_FILE: reportPath,
-          ...(baseUrl ? { ARATAME_BASE_URL: baseUrl } : {}),
-        },
-      });
+      let revision;
+      const verifyRevision = async () => {
+        if (!revision) return;
+        try {
+          const current = await safePath(project, specPath);
+          if (
+            !(await fs.stat(current)).isFile() ||
+            createHash("sha256")
+              .update(await fs.readFile(current))
+              .digest("hex") !== revision.sha256
+          )
+            throw new Error("Script bytes changed");
+        } catch {
+          throw new Error(
+            `Script revision changed or became unreadable: ${specPath}. Execution cannot certify the bound bytes; original script evidence remains local at ${revision.evidence}.`,
+          );
+        }
+      };
+      if (run.changeSetId) {
+        revision = scriptRevisions.get(item.id);
+        if (!revision) {
+          const bytes = await fs.readFile(absolute);
+          const sha256 = createHash("sha256").update(bytes).digest("hex");
+          const evidence = `${artifactRoot}/scripts/${item.id}-${sha256}${path.extname(specPath)}`;
+          const copy = await writeGenerated(project, evidence, bytes);
+          await fs.chmod(copy, 0o400);
+          revision = { sha256, specPath, specTag, evidence };
+          scriptRevisions.set(item.id, revision);
+        }
+        if (revision.specPath !== specPath || revision.specTag !== specTag)
+          throw new Error("Script selection changed within the assigned run");
+        await verifyRevision();
+        await api(
+          `/runs/${run.id}/scripts`,
+          {
+            leaseToken,
+            caseId: item.id,
+            caseVersion: item.version,
+            specPath,
+            ...(specTag ? { specTag } : {}),
+            sha256: revision.sha256,
+          },
+          signal,
+        );
+        // Keep execution at its original path for relative imports and config.
+        // The read-only copy is evidence, not repository/dependency isolation.
+        await verifyRevision();
+      }
+      let execution;
+      try {
+        execution = await processRun(process.execPath, args, {
+          cwd: project,
+          signal,
+          timeout: config.testTimeoutMs || 180_000,
+          env: {
+            PLAYWRIGHT_JSON_OUTPUT_FILE: reportPath,
+            ...(baseUrl ? { ARATAME_BASE_URL: baseUrl } : {}),
+          },
+        });
+      } finally {
+        // Even a failed/aborted process cannot certify mutated source bytes.
+        await verifyRevision();
+      }
       logs.push(
         `${phase} ${specPath}: exit ${execution.code}\n${execution.output}`,
       );
@@ -312,6 +369,9 @@ export async function executeJob(config, job, api, signal) {
         evidence: reportRelative,
         specPath,
         ...(specTag ? { specTag } : {}),
+        ...(revision && executed.length
+          ? { scriptSha256: revision.sha256 }
+          : {}),
       };
     };
     let configPath;
