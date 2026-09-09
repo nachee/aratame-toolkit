@@ -189,7 +189,7 @@ async function main() {
     }
     await file.close();
     console.log(
-      `Runner enrolled. Private config: ${filename}\nStart: node runner/cli.mjs start --config ${JSON.stringify(filename)}`,
+      `Runner enrolled. Private config: ${filename}\nStart: npx aratame start --config ${JSON.stringify(filename)}`,
     );
     return;
   }
