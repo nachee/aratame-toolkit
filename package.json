@@ -1,0 +1,42 @@
+{
+  "name": "@aratame/toolkit",
+  "version": "0.1.0",
+  "description": "Standalone file-driven QA planning, Playwright execution and BYOK browser exploration, with an optional Aratame Cloud worker",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nachee/aratame-toolkit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nachee/aratame-toolkit/issues"
+  },
+  "homepage": "https://github.com/nachee/aratame-toolkit#readme",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "aratame": "cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test *.test.mjs",
+    "start": "node cli.mjs"
+  },
+  "files": [
+    "cli.mjs",
+    "execution.mjs",
+    "exploration.mjs",
+    "model.mjs",
+    "standalone.mjs",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "examples/"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@playwright/test": "^1.58.2",
+    "chrome-devtools-mcp": "^1.9.0",
+    "zod": "^4.3.6"
+  }
+}

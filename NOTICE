@@ -1,0 +1,14 @@
+Aratame Toolkit
+Copyright 2026 Aratame contributors.
+
+The original toolkit source in this package is licensed under the Apache
+License, Version 2.0. The proprietary Aratame Cloud application is not included
+in this package and is not covered by this license.
+
+Third-party dependencies retain their own copyrights and licenses. Dependencies
+are installed separately by npm; consult their distributed license notices.
+
+The toolkit does not impose an Aratame Cloud subscription requirement on the
+Playwright tests it generates. User-supplied content and third-party material
+remain subject to their respective rights. The Apache license does not grant
+rights to Aratame trademarks beyond the terms of that license.

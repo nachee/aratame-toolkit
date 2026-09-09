@@ -1,0 +1,4 @@
+Example requirement, not a claim about an existing application:
+The application's public home page at / must display the exact accessible heading Welcome.
+No authentication or fixture is required for this example.
+Replace this file with your actual requirements before planning against your application.

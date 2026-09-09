@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "title": "Example public home page requirement",
+  "baseUrl": "http://localhost:3000",
+  "requirements": "The public home page at / must display the exact accessible heading Welcome. No authentication or fixture is required.",
+  "sources": [],
+  "rationale": "A handwritten example of the plan format, not generated evidence or an executed result. Replace it with the requirements of your application.",
+  "gaps": [
+    "This example does not establish that any target application implements the stated requirement."
+  ],
+  "cases": [
+    {
+      "id": "home-heading",
+      "version": 1,
+      "title": "Public home page welcome heading",
+      "surface": "Home",
+      "category": "smoke",
+      "priority": "P1",
+      "preconditions": "An authorized test application is running at the configured baseUrl; no login or fixture is required by this example requirement.",
+      "steps": [
+        "Navigate to /",
+        "Observe the exact accessible heading Welcome"
+      ],
+      "expected": "The home page displays a visible accessible heading with the exact text Welcome."
+    }
+  ]
+}

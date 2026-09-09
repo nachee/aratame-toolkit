@@ -1,0 +1,9 @@
+{
+  "baseUrl": "http://localhost:3000",
+  "model": {
+    "provider": "openai",
+    "model": "gpt-4.1",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "browserContext": "Use an authorized disposable test environment. This example requires no login or fixture. Replace this context with your actual non-secret prerequisites."
+}
