@@ -12,6 +12,7 @@ const capabilities = [
   "chrome-devtools-mcp",
   "restricted-browser-authoring",
   "script-revisions-v1",
+  "linked-repair-v1",
 ];
 
 const help = `Aratame QA toolkit — local-first, no Aratame account required
@@ -20,16 +21,21 @@ Standalone (file paths are relative to --project):
   aratame plan --project . --config aratame.json --requirements requirements.txt [--context context.txt ...] [--output e2e/aratame/plan.json]
   aratame review --project . --plan e2e/aratame/plan.json
   aratame run --project . --config aratame.json --plan e2e/aratame/plan.json --approve SHA256
+  aratame review --project . --plan e2e/aratame/plan.json --repair-review e2e/aratame/local-FAILED_RUN.json
+  aratame run --project . --config aratame.json --plan e2e/aratame/plan.json --approve PLAN_SHA256 --repair-review e2e/aratame/local-FAILED_RUN.json --approve-repair REPAIR_SHA256
 
 plan sends specified requirement/context files directly to your configured BYOK provider
 (OpenAI, Anthropic, OpenRouter), validates the draft/critique/merge, and writes a draft.
 review displays the complete validated plan and its SHA256. Inspect its cases, gaps,
 target and linked specs, plus your config/fixture. run requires that exact digest.
-All listed cases execute. Existing linked Playwright tests run first; failures are
-never rewritten to pass. Uncovered cases use real, origin-restricted browser AI
-exploration, then generated Playwright verification. No AI shell/code execution.
+All listed cases execute. Linked failures retain their original evidence. Optional
+repair.enabled proposes bounded locator repairs; exact approval selects a separate
+feature-owned copy in a NEW run, verified with the original regression selection.
+No baseline overwrite, changed assertions, AI shell execution, or approval-as-pass.
 Local config: {baseUrl, model:{provider,model,apiKeyEnv}, playwrightConfig?,
-storageState?, fixture?:[executable,...args], browserContext?, testTimeoutMs?, deploymentLabel?}.
+storageState?, fixture?:[executable,...args], browserContext?, testTimeoutMs?, deploymentLabel?,
+repair?:{enabled:boolean,approval?:"manual"|"locator_only"|"behavior_preserving"}}.
+Repair is opt-in; approval defaults manual and is separate from --approve plan.
 model is required for planning/uncovered cases; apiKeyEnv names your environment
 variable, never a literal key. The selected model must support tool use for exploration.
 Fixtures run only if explicitly configured; they may run before and after exploration.
@@ -57,7 +63,8 @@ Enrollment consumes a one-time token and saves a mode-0600 credential file at
 uploads reports/reviews and sends model requests through Cloud. --once handles
 at most one job. Optional local execution settings are the same as above, except
 Cloud chooses its configured model rather than the local model setting.
-No application edits, billing checkout, git pushes or automatic automation approvals.
+No application edits, billing checkout, git pushes or implicit publication.
+Connected repair policy comes only from Cloud, never the local repair setting.
 `;
 function serverURL(value) {
   const url = new URL(value);
@@ -138,6 +145,8 @@ async function main() {
       output: { type: "string" },
       plan: { type: "string" },
       approve: { type: "string" },
+      "repair-review": { type: "string" },
+      "approve-repair": { type: "string" },
     },
   });
   if (values.help || !positionals.length) {
@@ -278,21 +287,76 @@ async function main() {
           report = await executeJob(config, job, api, signal);
         } catch (error) {
           report = {
+            ...error.partialReport,
             status: "blocked",
             error: error.message,
             logs: error.message,
-            results: job.cases.map((item) => ({
-              caseId: item.id,
-              caseVersion: item.version,
-              status: "blocked",
-              detail: `Execution stopped: ${error.message}`,
-              testCount: 0,
-            })),
+            results: job.cases.map(
+              (item) =>
+                error.partialReport?.results.find(
+                  (result) => result.caseId === item.id,
+                ) || {
+                  caseId: item.id,
+                  caseVersion: item.version,
+                  status: "blocked",
+                  detail: `Execution stopped: ${error.message}`,
+                  testCount: 0,
+                },
+            ),
           };
         }
         // Server rechecks assignment, version, revocation and cancellation; never retry a stale report.
         // The operator deployment receipt remains local, never part of the hosted report.
-        const { localReceipt: _localReceipt, ...hostedReport } = report;
+        const {
+          localReceipt: _localReceipt,
+          repairs: _repairs,
+          ...hostedReport
+        } = report;
+        if (
+          job.settings?.repairEnabled ||
+          job.reviews?.some((review) => review.kind === "repair")
+        ) {
+          // Full failure output, browser artifacts and source remain runner-local.
+          hostedReport.logs =
+            "Linked repair execution evidence retained on the assigned runner.";
+          if (hostedReport.error)
+            hostedReport.error =
+              "Execution blocked; inspect runner-local evidence.";
+          hostedReport.results = hostedReport.results.map((result) => {
+            const repair = (hostedReport.reviews || []).find(
+              (review) =>
+                review.kind === "repair" &&
+                review.caseId === result.caseId &&
+                review.proposal,
+            );
+            const proposal = repair ? JSON.parse(repair.proposal) : undefined;
+            const originalFailure =
+              result.status === "failed" &&
+              result.scriptSha256 === proposal?.original.sha256
+                ? proposal.originalFailure
+                : undefined;
+            return {
+              ...result,
+              detail:
+                originalFailure?.detail ||
+                `Playwright ${result.status}; ${result.testCount} test(s). Full evidence retained on the assigned runner.`,
+              ...(originalFailure?.evidence
+                ? { evidence: originalFailure.evidence }
+                : {}),
+            };
+          });
+          hostedReport.reviews = (hostedReport.reviews || []).map((review) => ({
+            ...review,
+            detail:
+              review.kind === "repair"
+                ? "Bounded linked repair proposal; original failure retained on the runner. Approval selects a new run, not a passing result."
+                : /no progress|repeated proposal/i.test(review.detail || "")
+                  ? "Repair stopped without applying changes: no progress. Original failure retained on the runner."
+                  : /budget exhausted/i.test(review.detail || "")
+                    ? "Repair stopped without applying changes: attempt budget exhausted. Revise the plan or review the original failure."
+                    : "Linked execution requires review. Full failure evidence remains on the assigned runner.",
+          }));
+        }
         const completed = await api(`/runs/${job.run.id}/report`, {
           ...hostedReport,
           leaseToken: job.leaseToken,
