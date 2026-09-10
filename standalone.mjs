@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { executeJob, safePath, writeGenerated } from "./execution.mjs";
 import { createModelClient, modelSchema } from "./model.mjs";
+import { validateRepairProposal } from "./repair.mjs";
 
 const relativePath = z
   .string()
@@ -54,6 +55,15 @@ const configSchema = z
       .optional(),
     browserContext: z.string().max(10_000).optional(),
     testTimeoutMs: z.number().int().min(1000).max(600_000).optional(),
+    repair: z
+      .object({
+        enabled: z.boolean().default(false),
+        approval: z
+          .enum(["manual", "locator_only", "behavior_preserving"])
+          .default("manual"),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 const behaviorSchema = z
@@ -197,11 +207,61 @@ export async function standalone(command, values) {
       const raw = await readInput(project, values.plan, 2_000_000);
       const plan = validate(planSchema, parseJson(raw, "Plan"), "Plan");
       const hash = digest(raw);
+      let repairReport;
+      let repairDigest;
+      let selectedRepairs = [];
+      if (values["repair-review"]) {
+        const repairRaw = await readInput(
+          project,
+          values["repair-review"],
+          2_000_000,
+        );
+        repairReport = parseJson(repairRaw, "Repair report");
+        repairDigest = digest(repairRaw);
+        if (
+          repairReport.planSha256 !== hash ||
+          repairReport.baseUrl !== plan.baseUrl
+        )
+          throw new Error(
+            "Repair report does not belong to this exact reviewed plan and target",
+          );
+        selectedRepairs = (repairReport.reviews || [])
+          .filter(
+            (review) =>
+              review.kind === "repair" &&
+              review.status !== "rejected" &&
+              review.proposal,
+          )
+          .map((review) => {
+            const item = plan.cases.find((entry) => entry.id === review.caseId);
+            if (!item)
+              throw new Error("Repair report refers to an unselected case");
+            const proposal = validateRepairProposal(
+              JSON.parse(review.proposal),
+              item,
+            );
+            if (proposal.baseUrl !== plan.baseUrl)
+              throw new Error("Repair proposal target changed");
+            return { ...review, proposal: JSON.stringify(proposal) };
+          });
+        if (!selectedRepairs.length)
+          throw new Error("Repair report contains no selectable proposals");
+      } else if (values["approve-repair"]) {
+        throw new Error(
+          "--approve-repair requires --repair-review with the exact local report",
+        );
+      }
       if (command === "review") {
         console.log(JSON.stringify(plan, null, 2));
         console.log(
           `\nApproval SHA256: ${hash}\nReview every case, target URL, gap and linked spec. Inspect your local execution config and fixture too. Execution requires: --approve ${hash}\nEditing the plan changes its approval digest. All listed cases execute, including edge/regression.`,
         );
+        if (repairReport) {
+          console.log(JSON.stringify(selectedRepairs, null, 2));
+          console.log(
+            `Repair approval SHA256: ${repairDigest}\nThis is separate from plan approval. Inspect the original failure and bounded diff; approval only selects a NEW verification run. Use --repair-review ${values["repair-review"]} --approve-repair ${repairDigest}.`,
+          );
+        }
         return;
       }
       if (values.approve !== hash)
@@ -218,6 +278,38 @@ export async function standalone(command, values) {
         throw new Error(
           "Config baseUrl differs from the reviewed plan. Update and review the plan before execution.",
         );
+      if (selectedRepairs.length) {
+        const explicitApproval = values["approve-repair"] === repairDigest;
+        if (values["approve-repair"] && !explicitApproval)
+          throw new Error(
+            "Repair approval digest does not match this exact report",
+          );
+        for (const review of selectedRepairs) {
+          const proposal = JSON.parse(review.proposal);
+          const classification = proposal.classification;
+          const automatic =
+            config.repair?.enabled &&
+            !classification.ambiguous &&
+            (config.repair.approval === "behavior_preserving" ||
+              (config.repair.approval === "locator_only" &&
+                classification.category === "locator_only"));
+          if (!classification.applicable)
+            throw new Error(
+              "Behavioral or unsupported repair cannot be approved; revise the plan",
+            );
+          if (!explicitApproval && !automatic)
+            throw new Error(
+              "Repair requires --approve-repair with the exact report digest; plan approval does not approve repairs",
+            );
+          review.status = "approved";
+          review.approvalDecision = {
+            basis: explicitApproval
+              ? "manual exact report digest"
+              : `local policy ${config.repair.approval}`,
+            digest: repairDigest,
+          };
+        }
+      }
       let client;
       const needsModel = plan.cases.some(
         (item) =>
@@ -238,15 +330,33 @@ export async function standalone(command, values) {
         run: { id: runId },
         plan,
         cases: plan.cases,
-        reviews: [],
-        settings: { baseUrl: plan.baseUrl },
+        reviews: selectedRepairs,
+        repairHistory: [
+          ...(repairReport?.repairHistory || []),
+          ...(repairReport?.reviews || []).filter(
+            (review) => review.kind === "repair",
+          ),
+        ],
+        settings: {
+          baseUrl: plan.baseUrl,
+          repairEnabled: config.repair?.enabled === true,
+        },
       };
       // This adapter is entirely in-process: local jobs never call the Aratame API.
       const api = async (endpoint, body, requestSignal) => {
         requestSignal?.throwIfAborted();
         if (endpoint === "/heartbeat") return {};
-        if (endpoint === `/runs/${runId}/model` && body.role === "browser") {
-          if (!client) throw new Error("Browser model is not configured.");
+        if (
+          endpoint === `/runs/${runId}/model` &&
+          ["browser", "repair"].includes(body.role)
+        ) {
+          if (!client) {
+            if (!config.model)
+              throw new Error(
+                "Linked repair requires an explicit BYOK model configuration",
+              );
+            client = createModelClient(config.model);
+          }
           return await client.invoke(body.messages, body.tools, requestSignal);
         }
         throw new Error("Unsupported local execution operation.");
@@ -257,16 +367,22 @@ export async function standalone(command, values) {
       } catch (error) {
         const detail = client ? client.redact(error.message) : error.message;
         report = {
+          ...error.partialReport,
           status: "blocked",
           error: detail,
-          results: plan.cases.map((item) => ({
-            caseId: item.id,
-            caseVersion: item.version,
-            status: "blocked",
-            detail,
-            testCount: 0,
-          })),
-          reviews: [],
+          results: plan.cases.map(
+            (item) =>
+              error.partialReport?.results.find(
+                (result) => result.caseId === item.id,
+              ) || {
+                caseId: item.id,
+                caseVersion: item.version,
+                status: "blocked",
+                detail,
+                testCount: 0,
+              },
+          ),
+          reviews: error.partialReport?.reviews || [],
           ...(error.localReceipt ? { localReceipt: error.localReceipt } : {}),
         };
       }
@@ -278,6 +394,7 @@ export async function standalone(command, values) {
             planSha256: hash,
             planPath: values.plan,
             baseUrl: plan.baseUrl,
+            repairHistory: job.repairHistory,
             ...report,
           },
           null,

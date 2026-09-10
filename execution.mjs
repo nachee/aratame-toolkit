@@ -3,7 +3,13 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { compileScenario, exploreCase } from "./exploration.mjs";
+import {
+  compileScenario,
+  exploreCase,
+  exploreRepairCase,
+} from "./exploration.mjs";
+import { applyRepairProposal, validateRepairProposal } from "./repair.mjs";
+import { pathToFileURL } from "node:url";
 
 export async function safePath(project, relative, createParents = false) {
   if (
@@ -116,6 +122,10 @@ export async function executeJob(config, job, api, signal) {
   const reviews = [];
   const results = [];
   const scriptRevisions = new Map();
+  const repairs = [];
+  const selections = new Map();
+  const repairEnabled = job.settings?.repairEnabled === true;
+  const repairHistory = job.repairHistory || job.run.repairHistory || [];
   const baseUrl = config.baseUrl || job.settings?.baseUrl;
   if (
     config.deploymentLabel !== undefined &&
@@ -236,12 +246,15 @@ export async function executeJob(config, job, api, signal) {
         "--workers=1",
         "--retries=0",
         "--forbid-only",
+        "--update-snapshots=none",
         "--trace=on",
         "--timeout=30000",
         `--output=${tracePath}`,
       ];
       if (specTag) args.push("--grep", escape(specTag));
-      if (generated) args.push("--config", await generatedConfig());
+      if (selections.get(item.id)?.repair)
+        args.push("--config", await repairedConfig(item, specPath));
+      else if (generated) args.push("--config", await generatedConfig());
       else if (config.playwrightConfig)
         args.push("--config", await safePath(project, config.playwrightConfig));
       let revision;
@@ -262,7 +275,7 @@ export async function executeJob(config, job, api, signal) {
           );
         }
       };
-      if (run.changeSetId) {
+      if (run.changeSetId || repairEnabled || selections.get(item.id)?.repair) {
         revision = scriptRevisions.get(item.id);
         if (!revision) {
           const bytes = await fs.readFile(absolute);
@@ -276,20 +289,20 @@ export async function executeJob(config, job, api, signal) {
         if (revision.specPath !== specPath || revision.specTag !== specTag)
           throw new Error("Script selection changed within the assigned run");
         await verifyRevision();
-        await api(
-          `/runs/${run.id}/scripts`,
-          {
-            leaseToken,
-            caseId: item.id,
-            caseVersion: item.version,
-            specPath,
-            ...(specTag ? { specTag } : {}),
-            sha256: revision.sha256,
-          },
-          signal,
-        );
-        // Keep execution at its original path for relative imports and config.
-        // The read-only copy is evidence, not repository/dependency isolation.
+        if (run.changeSetId)
+          await api(
+            `/runs/${run.id}/scripts`,
+            {
+              leaseToken,
+              caseId: item.id,
+              caseVersion: item.version,
+              specPath,
+              ...(specTag ? { specTag } : {}),
+              sha256: revision.sha256,
+            },
+            signal,
+          );
+        // Source copies are evidence, not repository/dependency isolation.
         await verifyRevision();
       }
       let execution;
@@ -391,6 +404,145 @@ export async function executeJob(config, job, api, signal) {
       );
       return configPath;
     }
+    const repairConfigs = new Map();
+    async function repairedConfig(item, specPath) {
+      if (repairConfigs.has(item.id)) return repairConfigs.get(item.id);
+      let originalConfig = config.playwrightConfig;
+      if (!originalConfig) {
+        for (const extension of ["ts", "js", "mts", "mjs", "cts", "cjs"]) {
+          const candidate = `playwright.config.${extension}`;
+          try {
+            if ((await fs.stat(await safePath(project, candidate))).isFile()) {
+              originalConfig = candidate;
+              break;
+            }
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+        }
+      }
+      const absolute = item.specPath.startsWith("e2e/aratame/")
+        ? await generatedConfig()
+        : originalConfig
+          ? await safePath(project, originalConfig)
+          : undefined;
+      const root = absolute ? path.dirname(absolute) : project;
+      const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const originalSpec = await safePath(project, item.specPath);
+      const discoveryPath = await safePath(
+        project,
+        `${artifactRoot}/${item.id}-repair-projects.json`,
+        true,
+      );
+      const discoveryArgs = [
+        playwright,
+        "test",
+        escape(originalSpec),
+        "--list",
+        "--no-deps",
+        "--reporter=json",
+        "--forbid-only",
+      ];
+      if (absolute) discoveryArgs.push("--config", absolute);
+      if (item.specTag) discoveryArgs.push("--grep", escape(item.specTag));
+      const discovery = await processRun(process.execPath, discoveryArgs, {
+        cwd: project,
+        signal,
+        timeout: config.testTimeoutMs || 180_000,
+        env: {
+          PLAYWRIGHT_JSON_OUTPUT_FILE: discoveryPath,
+          ...(baseUrl ? { ARATAME_BASE_URL: baseUrl } : {}),
+        },
+      });
+      await writeGenerated(
+        project,
+        `${artifactRoot}/${item.id}-repair-projects.log`,
+        discovery.output,
+      );
+      if (discovery.code !== 0 || discovery.timedOut)
+        throw new Error(
+          "Original Playwright project selection could not be discovered; inspect local repair-projects evidence",
+        );
+      const discovered = JSON.parse(await fs.readFile(discoveryPath, "utf8"));
+      const selectedNames = [
+        ...new Set(testsFromReport(discovered).map((test) => test.projectName)),
+      ];
+      if (
+        discovered.errors?.length ||
+        !selectedNames.length ||
+        selectedNames.some((name) => typeof name !== "string")
+      )
+        throw new Error(
+          "Original linked test has no unambiguous Playwright project selection",
+        );
+      // Discover only direct execution projects. Dependencies and teardowns keep
+      // their own files, fixtures and discovery rules; never run the repair as setup.
+      const repairConfigPath = await writeGenerated(
+        project,
+        `${artifactRoot}/${item.id}-repair.config.mjs`,
+        `
+${absolute ? `import original from ${JSON.stringify(pathToFileURL(absolute).href)};` : "const original = {};"}
+import path from 'node:path';
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
+const root = ${JSON.stringify(root)};
+const originalSpec = ${JSON.stringify(originalSpec)};
+const candidate = ${JSON.stringify(path.join(project, specPath))};
+const selected = new Set(${JSON.stringify(selectedNames)});
+const metadata = ${JSON.stringify(discovered.config.projects)};
+const resolve = value => typeof value === 'string' ? path.resolve(root, value) : value;
+const rootTemplate = template => path.isAbsolute(template) ? template : root + path.sep + template;
+const resolveTemplate = template => /^\\{\\/?(?:testDir|snapshotDir)\\}/.test(template) ? template : rootTemplate(template);
+const legacyTemplate = '{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{-projectName}{-snapshotSuffix}{ext}';
+const ariaTemplate = '{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{ext}';
+function projectConfig(value) {
+  const name = value.name ?? original.name ?? '';
+  const effective = metadata.find(project => project.name === name);
+  if (!effective) throw new Error('Original project configuration changed during repair selection');
+  const snapshotDir = resolve(value.snapshotDir ?? original.snapshotDir) || effective.testDir;
+  const base = {...value, testDir: effective.testDir, outputDir: effective.outputDir, snapshotDir};
+  if (value.tsconfig) base.tsconfig = resolve(value.tsconfig);
+  const expectation = value.expect ?? original.expect ?? {};
+  const screenshot = expectation.toHaveScreenshot || {};
+  const stylePath = screenshot.stylePath;
+  const screenshotOptions = {...screenshot, ...(stylePath ? {stylePath: (Array.isArray(stylePath) ? stylePath : [stylePath]).map(resolve)} : {})};
+  base.expect = {...expectation, toHaveScreenshot: screenshotOptions};
+  if (!selected.has(name)) {
+    const template = value.snapshotPathTemplate ?? original.snapshotPathTemplate;
+    if (template) base.snapshotPathTemplate = resolveTemplate(template);
+    if (screenshot.pathTemplate) base.expect.toHaveScreenshot.pathTemplate = resolveTemplate(screenshot.pathTemplate);
+    if (expectation.toMatchAriaSnapshot?.pathTemplate)
+      base.expect.toMatchAriaSnapshot = {...expectation.toMatchAriaSnapshot, pathTemplate: resolveTemplate(expectation.toMatchAriaSnapshot.pathTemplate)};
+    return base;
+  }
+  const relative = path.relative(effective.testDir, originalSpec);
+  const tokens = {testDir: effective.testDir, snapshotDir, testFileDir: path.dirname(relative) === '.' ? '' : path.dirname(relative), testFileBaseName: path.parse(originalSpec).name, testFileName: path.basename(originalSpec), testFilePath: relative};
+  const relocateTemplate = template => rootTemplate(template.replace(/\\{(.)?(testDir|snapshotDir|testFileDir|testFileBaseName|testFileName|testFilePath)\\}/g, (_match, prefix, token) => (prefix || '') + tokens[token]));
+  const inheritedTemplate = value.snapshotPathTemplate ?? original.snapshotPathTemplate;
+  return {...base, testDir: ${JSON.stringify(project)}, testMatch: candidate, testIgnore: [],
+    snapshotPathTemplate: relocateTemplate(inheritedTemplate || legacyTemplate),
+    expect: {...base.expect,
+      toHaveScreenshot: {...screenshotOptions, pathTemplate: relocateTemplate(screenshot.pathTemplate || inheritedTemplate || legacyTemplate)},
+      toMatchAriaSnapshot: {...expectation.toMatchAriaSnapshot, pathTemplate: relocateTemplate(expectation.toMatchAriaSnapshot?.pathTemplate || inheritedTemplate || ariaTemplate)}
+    }
+  };
+}
+const require = createRequire(path.join(root, 'package.json'));
+const hook = id => fs.existsSync(resolve(id)) ? resolve(id) : require.resolve(id, {paths:[root]});
+const hooks = value => Array.isArray(value) ? value.map(hook) : hook(value);
+export default {
+  ...original,
+  ...(original.projects ? {testDir: resolve(original.testDir) || root, projects: original.projects.map(projectConfig)} : projectConfig(original)),
+  ...(original.tsconfig ? {tsconfig: resolve(original.tsconfig)} : {}),
+  ...(original.globalSetup ? {globalSetup: hooks(original.globalSetup)} : {}),
+  ...(original.globalTeardown ? {globalTeardown: hooks(original.globalTeardown)} : {}),
+  ...(original.webServer ? {webServer: (Array.isArray(original.webServer) ? original.webServer : [original.webServer]).map(server => ({...server, cwd: server.cwd ? resolve(server.cwd) : root}))} : {})
+};
+`,
+      );
+      repairConfigs.set(item.id, repairConfigPath);
+      return repairConfigPath;
+    }
     const existing = cases.filter(
       (item) =>
         item.specPath &&
@@ -398,30 +550,158 @@ export async function executeJob(config, job, api, signal) {
           item.automatedVersion === item.version),
     );
     const uncovered = cases.filter((item) => !existing.includes(item));
-    // Reuse first; do not explore or rewrite a linked failing test.
+    // Approval selects a new run's exclusive candidate, never a second binding
+    // after executing the original in this assignment.
     for (const item of existing) {
       let result;
+      const approved = (job.reviews || []).filter(
+        (review) =>
+          review.caseId === item.id &&
+          review.kind === "repair" &&
+          review.status === "approved" &&
+          review.proposal,
+      );
       try {
+        let selection = { specPath: item.specPath, specTag: item.specTag };
+        if (approved.length) {
+          if (approved.length !== 1)
+            throw new Error(
+              "Repair selection is ambiguous for this assignment",
+            );
+          const proposal = validateRepairProposal(
+            JSON.parse(approved[0].proposal),
+            item,
+          );
+          if (proposal.baseUrl !== baseUrl)
+            throw new Error("Repair target differs from the approved target");
+          const originalPath = await safePath(project, item.specPath);
+          const source = await fs.readFile(originalPath, "utf8");
+          const repaired = applyRepairProposal(proposal, source, item, baseUrl);
+          signal.throwIfAborted();
+          const specPath = proposal.proposedSpecPath;
+          try {
+            await writeGenerated(project, specPath, repaired);
+          } catch (error) {
+            if (error.code !== "EEXIST") throw error;
+            const candidate = await safePath(project, specPath);
+            if (
+              createHash("sha256")
+                .update(await fs.readFile(candidate))
+                .digest("hex") !== proposal.proposedSha256
+            )
+              throw new Error(
+                "Existing repair candidate differs from the exact approved bytes; nothing was overwritten",
+              );
+          }
+          selection = { specPath, specTag: item.specTag, repair: proposal };
+          repairs.push({
+            caseId: item.id,
+            proposal: approved[0].proposal,
+            originalFailure: proposal.originalFailure,
+            approval: approved[0].approvalDecision || {
+              basis: "exact local proposal digest",
+            },
+            verification: { status: "not_run", testCount: 0 },
+          });
+        }
+        selections.set(item.id, selection);
         result = await runSpec(
           item,
-          item.specPath,
-          item.specTag,
-          item.specPath.startsWith("e2e/aratame/"),
-          "existing",
+          selection.specPath,
+          selection.specTag,
+          !selection.repair && item.specPath.startsWith("e2e/aratame/"),
+          selection.repair ? "repair-verification" : "existing",
         );
+        if (selection.repair) {
+          repairs.find((entry) => entry.caseId === item.id).verification =
+            result;
+          result.detail = `Approved repair verification ${result.status}; original failure retained in repair history. ${result.detail}`;
+        }
       } catch (error) {
-        signal.throwIfAborted();
         result = { status: "blocked", detail: error.message, testCount: 0 };
+        const entry = repairs.find((entry) => entry.caseId === item.id);
+        if (entry) entry.verification = result;
       }
       results.push({ caseId: item.id, caseVersion: item.version, ...result });
-      if (result.status === "failed")
-        reviews.push({
+      if (result.status === "failed") {
+        const selection = selections.get(item.id);
+        const failure = {
           caseId: item.id,
           kind: "failure",
           title: `Review existing test: ${item.title}`,
-          detail: `${result.detail}\nNo application, assertion, or selector changes were made. A human must approve any non-selector repair; selector repairs require unambiguous evidence.`,
-        });
+          detail: `${result.detail}\nBaseline and required behavior were not changed.`,
+        };
+        reviews.push(failure);
+        if (repairEnabled && !signal.aborted) {
+          try {
+            const originalSha =
+              selection?.repair?.original.sha256 ||
+              scriptRevisions.get(item.id)?.sha256;
+            const history = repairHistory.filter(
+              (review) => review.caseId === item.id,
+            );
+            const previousProposals = history
+              .flatMap((review) => {
+                try {
+                  return [
+                    validateRepairProposal(JSON.parse(review.proposal), item),
+                  ];
+                } catch {
+                  return [];
+                }
+              })
+              .filter((proposal) => proposal.original.sha256 === originalSha);
+            if (previousProposals.length >= 3)
+              throw new Error(
+                "Repair attempt budget exhausted (3); revise the plan or resolve the failure manually",
+              );
+            const source = await fs.readFile(
+              await safePath(project, item.specPath),
+              "utf8",
+            );
+            if (
+              createHash("sha256").update(source).digest("hex") !== originalSha
+            )
+              throw new Error(
+                "Original script changed after the failed execution",
+              );
+            const { proposal, evidence } = await exploreRepairCase({
+              config,
+              job,
+              item,
+              baseUrl,
+              project,
+              artifactRoot,
+              api,
+              signal,
+              source,
+              originalFailure: selection?.repair?.originalFailure || result,
+              attempt: previousProposals.length + 1,
+              previousProposals,
+            });
+            if (
+              previousProposals.some(
+                (previous) =>
+                  previous.proposedSha256 === proposal.proposedSha256,
+              )
+            )
+              throw new Error(
+                "Repair stopped: repeated proposal made no progress",
+              );
+            reviews.push({
+              caseId: item.id,
+              kind: "repair",
+              title: `Review linked repair: ${item.title}`,
+              detail: `Original Playwright failure retained locally. ${proposal.classification.category}: ${proposal.classification.rationale}. ${proposal.classification.applicable ? "Exact proposal approval and a new run are required; not yet verified." : "Not applicable; revise the plan instead."} Local evidence: ${evidence}`,
+              proposal: JSON.stringify(proposal),
+            });
+          } catch (error) {
+            failure.detail += `\nRepair stopped without applying changes: ${error.message}`;
+          }
+        }
+      }
     }
+    signal.throwIfAborted();
     const generated = [];
     for (const item of uncovered) {
       signal.throwIfAborted();
@@ -437,7 +717,7 @@ export async function executeJob(config, job, api, signal) {
         continue;
       }
       try {
-        const approved = job.reviews.find(
+        const approved = (job.reviews || []).find(
           (review) =>
             review.caseId === item.id &&
             review.kind === "coverage" &&
@@ -539,21 +819,29 @@ export async function executeJob(config, job, api, signal) {
         });
     }
     // New tests can affect shared state: verify the pre-existing selection again, serially.
-    if (generated.length)
+    if (generated.length || repairs.length)
       for (const item of existing) {
+        if (!selections.has(item.id)) continue;
         let result;
         try {
           result = await runSpec(
             item,
-            item.specPath,
-            item.specTag,
-            item.specPath.startsWith("e2e/aratame/"),
+            selections.get(item.id)?.specPath || item.specPath,
+            selections.get(item.id)?.specTag || item.specTag,
+            !selections.get(item.id)?.repair &&
+              item.specPath.startsWith("e2e/aratame/"),
             "combined",
           );
         } catch (error) {
           signal.throwIfAborted();
           result = { status: "blocked", detail: error.message, testCount: 0 };
         }
+        const repair = repairs.find((entry) => entry.caseId === item.id);
+        if (repair) repair.regression = result;
+        // A later pass never erases an earlier verification failure.
+        const prior = results.find((entry) => entry.caseId === item.id);
+        if (prior && prior.status !== "passed" && result.status === "passed")
+          continue;
         results[results.findIndex((r) => r.caseId === item.id)] = {
           caseId: item.id,
           caseVersion: item.version,
@@ -582,6 +870,7 @@ export async function executeJob(config, job, api, signal) {
     const report = {
       results,
       reviews,
+      repairs,
       status,
       logs: logs.join("\n").slice(-90_000),
     };
@@ -592,6 +881,26 @@ export async function executeJob(config, job, api, signal) {
     );
     return { ...report, localReceipt };
   } catch (error) {
+    error.partialReport = {
+      results,
+      reviews,
+      repairs,
+      status: "blocked",
+      logs: logs.join("\n").slice(-90_000),
+    };
+    try {
+      await writeGenerated(
+        project,
+        `${artifactRoot}/interrupted-result.json`,
+        JSON.stringify(
+          { ...error.partialReport, error: error.message },
+          null,
+          2,
+        ),
+      );
+    } catch {
+      // Preserve the execution error even if the filesystem is no longer writable.
+    }
     error.localReceipt = localReceipt;
     throw error;
   }
