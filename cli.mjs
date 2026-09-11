@@ -14,6 +14,7 @@ const capabilities = [
   "script-revisions-v1",
   "linked-repair-v1",
   "published-artifacts-v1",
+  "published-artifacts-v2",
 ];
 
 const help = `Aratame QA toolkit — local-first, no Aratame account required
