@@ -72,7 +72,7 @@ test('save', async ({page, baseURL}) => {
   expect(baseURL).toBe(${JSON.stringify(baseUrl)});
   await page.goto('/');
   expect(await page.context().cookies()).toContainEqual(expect.objectContaining({name:'fixture',value:'ready'}));
-  await ${before}.click({timeout:100});
+  await ${before}.click({timeout:5000});
   await expect(page.getByText(expected, {exact:true})).toBeVisible();
   expect(expected).toMatchSnapshot('state.txt');
 });\n`;
@@ -242,7 +242,7 @@ test("linked Toolkit-generated failures and approved repairs retain generated di
   );
   const specPath = "e2e/aratame/already-linked.spec.mjs";
   const before = "page.getByText('Old')";
-  const source = `import {test,expect} from '@playwright/test'; test('linked generated',async({page})=>{await page.setContent('<button>Ready</button>');await ${before}.click({timeout:100});await expect(page.getByRole('button')).toHaveText('Ready');});`;
+  const source = `import {test,expect} from '@playwright/test'; test('linked generated',async({page})=>{await page.setContent('<button>Ready</button>');await ${before}.click({timeout:5000});await expect(page.getByRole('button')).toHaveText('Ready');});`;
   await fs.writeFile(path.join(project, specPath), source);
   const item = {
     id: "generated",

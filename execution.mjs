@@ -10,6 +10,7 @@ import {
 } from "./exploration.mjs";
 import { applyRepairProposal, validateRepairProposal } from "./repair.mjs";
 import { pathToFileURL } from "node:url";
+import { artifactPathSchema, artifactRevisionSchema, readPublishedArtifacts } from "./published-artifacts.mjs";
 
 export async function safePath(project, relative, createParents = false) {
   if (
@@ -116,13 +117,78 @@ function testsFromReport(report) {
 }
 export async function executeJob(config, job, api, signal) {
   const { run, cases, leaseToken } = job;
+  const assignedPins = [job.publishedRevision, run.publishedRevision, job.plan?.publishedRevision].filter((value) => value !== undefined);
+  const publishedRevision = assignedPins.length ? artifactRevisionSchema.parse(assignedPins[0]) : undefined;
+  for (const pin of assignedPins) {
+    const parsed = artifactRevisionSchema.parse(pin);
+    if (Object.keys(parsed).some((key) => parsed[key] !== publishedRevision[key]))
+      throw new Error("Assigned published revisions disagree");
+  }
+  const candidatePins = [job.candidateRevision, run.candidateRevision].filter((value) => value !== undefined);
+  const candidateRevision = candidatePins.length ? artifactRevisionSchema.parse(candidatePins[0]) : undefined;
+  for (const pin of candidatePins) {
+    const parsed = artifactRevisionSchema.parse(pin);
+    if (Object.keys(parsed).some((key) => parsed[key] !== candidateRevision[key]))
+      throw new Error("Assigned candidate revisions disagree");
+  }
+  // A proposed checkout is execution evidence, never accepted planning authority.
+  const checkoutRevision = candidateRevision ?? publishedRevision;
   const project = await fs.realpath(config.project);
   const artifactRoot = `e2e/aratame/.artifacts/${run.id}-${Date.now()}`;
+  const localFiles = new Map((config.localFiles || []).map((file) => [artifactPathSchema.parse(file.path), file.sha256]));
+  const writeJobFile = async (root, relative, content) => {
+    const written = await writeGenerated(root, relative, content);
+    if (!relative.startsWith(`${artifactRoot}/`))
+      localFiles.set(relative, createHash("sha256").update(content).digest("hex"));
+    return written;
+  };
+  let inputsVerified = false;
   const logs = [];
   const reviews = [];
   const results = [];
   const scriptRevisions = new Map();
   const repairs = [];
+  let supportingFileRevisions;
+  const verifyInputs = async () => {
+    const published = checkoutRevision
+      ? await readPublishedArtifacts({
+          projectDir: config.project, revision: checkoutRevision,
+          localFiles: [...localFiles].map(([path, sha256]) => ({ path, sha256 })).concat(
+            (job.supportingFiles || []).filter((file) => !localFiles.has(file?.path)),
+          ),
+          outputDirectories: [artifactRoot],
+        })
+      : undefined;
+    const requested = job.supportingFiles || [];
+    if (!Array.isArray(requested) || requested.length > 500)
+      throw new Error("Supporting files must be a bounded explicit list");
+    if (published?.files.some((file) => file.kind === "fixture" && !requested.some((entry) => entry?.path === file.path && entry.sha256 === file.sha256)))
+      throw new Error("Assigned supporting files omit or replace a published fixture");
+    const captured = [];
+    let totalBytes = 0;
+    for (const file of requested) {
+      if (!file || Object.keys(file).some((key) => !["path", "sha256"].includes(key)) ||
+        !artifactPathSchema.safeParse(file.path).success || !/^[a-f0-9]{64}$/.test(file.sha256))
+        throw new Error("Invalid assigned supporting file");
+      if (captured.some((entry) => entry.path === file.path))
+        throw new Error("Duplicate assigned supporting file");
+      const publishedFile = published?.files.find((entry) => entry.path === file.path);
+      if (publishedFile && (publishedFile.kind !== "fixture" || publishedFile.sha256 !== file.sha256))
+        throw new Error(`Supporting file conflicts with the published revision: ${file.path}`);
+      const absolute = await safePath(project, file.path);
+      const stat = await fs.stat(absolute);
+      if (!stat.isFile() || stat.size > 1_000_000)
+        throw new Error(`Supporting file is not a bounded ordinary file: ${file.path}`);
+      const bytes = await fs.readFile(absolute);
+      totalBytes += bytes.length;
+      if (bytes.length > 1_000_000 || totalBytes > 10_000_000)
+        throw new Error("Supporting files exceed the approved file budget");
+      if (createHash("sha256").update(bytes).digest("hex") !== file.sha256)
+        throw new Error(`Supporting file differs from approved bytes: ${file.path}`);
+      captured.push({ path: file.path, sha256: file.sha256 });
+    }
+    supportingFileRevisions = captured;
+  };
   const selections = new Map();
   const repairEnabled = job.settings?.repairEnabled === true;
   const repairHistory = job.repairHistory || job.run.repairHistory || [];
@@ -140,6 +206,8 @@ export async function executeJob(config, job, api, signal) {
     runId: run.id,
     deploymentLabel: config.deploymentLabel?.trim() ?? null,
     cloudDeploymentIdentity: run.deploymentIdentity ?? null,
+    ...(publishedRevision ? { publishedRevision } : {}),
+    ...(candidateRevision ? { candidateRevision } : {}),
     target: baseUrl || null,
     targetScope: "configured runner target; existing specs may override",
     cases: cases.map((item) => ({
@@ -150,6 +218,37 @@ export async function executeJob(config, job, api, signal) {
     artifactRoot: path.join(project, artifactRoot),
   };
   try {
+    if (checkoutRevision) {
+      const capture = async (filename, expected) => {
+        if (localFiles.has(filename)) return;
+        const absolute = await safePath(project, artifactPathSchema.parse(filename));
+        const stat = await fs.stat(absolute);
+        if (!stat.isFile() || stat.size > 2_000_000) throw new Error(`Local input is not a bounded ordinary file: ${filename}`);
+        const bytes = await fs.readFile(absolute);
+        localFiles.set(filename, expected || createHash("sha256").update(bytes).digest("hex"));
+      };
+      for (const filename of [config.localConfigPath, config.playwrightConfig, config.storageState].filter(Boolean))
+        await capture(filename);
+      for (const item of cases.filter((entry) => entry.specPath))
+        await capture(item.specPath, item.sha256);
+      for (const review of (job.reviews || []).filter((entry) => entry.kind === "repair" && entry.status === "approved" && entry.proposal)) {
+        const item = cases.find((entry) => entry.id === review.caseId);
+        if (!item) throw new Error("Approved repair is not selected by this assignment");
+        const proposal = validateRepairProposal(JSON.parse(review.proposal), item);
+        if (proposal.baseUrl !== baseUrl) throw new Error("Repair target differs from the approved target");
+        try {
+          await fs.lstat(await safePath(project, proposal.proposedSpecPath));
+          localFiles.set(proposal.proposedSpecPath, proposal.proposedSha256);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          // An absent approved candidate becomes mandatory only after our exclusive write.
+        }
+      }
+    }
+    // Reserve this run's output directory exclusively; never infer prior output ownership.
+    await fs.mkdir(await safePath(project, artifactRoot, true), { mode: 0o700 });
+    await verifyInputs();
+    inputsVerified = true;
     if (baseUrl) {
       const target = new URL(baseUrl);
       if (
@@ -161,11 +260,9 @@ export async function executeJob(config, job, api, signal) {
           "Target baseUrl must use HTTP(S) without embedded credentials",
         );
     }
-    await writeGenerated(
-      project,
-      `${artifactRoot}/deployment-receipt.json`,
-      JSON.stringify(localReceipt, null, 2),
-    );
+    await writeJobFile(project,
+    `${artifactRoot}/deployment-receipt.json`,
+    JSON.stringify(localReceipt, null, 2),);
     let playwright;
     try {
       playwright = createRequire(path.join(project, "package.json")).resolve(
@@ -176,17 +273,16 @@ export async function executeJob(config, job, api, signal) {
         "Project Playwright dependency missing: install @playwright/test in the customer project and run npx playwright install chromium there.",
       );
     }
-    await writeGenerated(
-      project,
-      `${artifactRoot}/assignment.json`,
-      JSON.stringify(
-        { runId: run.id, cases, startedAt: localReceipt.startedAt },
-        null,
-        2,
-      ),
-    );
+    await writeJobFile(project,
+    `${artifactRoot}/assignment.json`,
+    JSON.stringify(
+      { runId: run.id, cases, startedAt: localReceipt.startedAt },
+      null,
+      2,
+    ),);
     const runFixture = async (phase) => {
       if (!config.fixture) return;
+      await verifyInputs();
       if (
         !Array.isArray(config.fixture) ||
         !config.fixture.length ||
@@ -204,11 +300,9 @@ export async function executeJob(config, job, api, signal) {
         config.fixture.slice(1),
         { cwd: project, signal, timeout: 120_000 },
       );
-      await writeGenerated(
-        project,
-        `${artifactRoot}/fixture-${phase}.log`,
-        fixture.output,
-      );
+      await writeJobFile(project,
+      `${artifactRoot}/fixture-${phase}.log`,
+      fixture.output,);
       logs.push(
         `Fixture ${phase} exit ${fixture.code}; output retained locally at ${artifactRoot}/fixture-${phase}.log`,
       );
@@ -218,6 +312,7 @@ export async function executeJob(config, job, api, signal) {
         );
     };
     await runFixture("initial");
+    await verifyInputs();
     const runSpec = async (
       item,
       specPath,
@@ -226,6 +321,7 @@ export async function executeJob(config, job, api, signal) {
       phase = "verify",
     ) => {
       signal.throwIfAborted();
+      await verifyInputs();
       await api("/heartbeat", { runId: run.id, leaseToken }, signal);
       const absolute = await safePath(project, specPath);
       if (!(await fs.stat(absolute)).isFile())
@@ -281,7 +377,7 @@ export async function executeJob(config, job, api, signal) {
           const bytes = await fs.readFile(absolute);
           const sha256 = createHash("sha256").update(bytes).digest("hex");
           const evidence = `${artifactRoot}/scripts/${item.id}-${sha256}${path.extname(specPath)}`;
-          const copy = await writeGenerated(project, evidence, bytes);
+          const copy = await writeJobFile(project, evidence, bytes);
           await fs.chmod(copy, 0o400);
           revision = { sha256, specPath, specTag, evidence };
           scriptRevisions.set(item.id, revision);
@@ -307,6 +403,7 @@ export async function executeJob(config, job, api, signal) {
       }
       let execution;
       try {
+        await verifyInputs();
         execution = await processRun(process.execPath, args, {
           cwd: project,
           signal,
@@ -397,11 +494,9 @@ export async function executeJob(config, job, api, signal) {
       const storageState = config.storageState
         ? await safePath(project, config.storageState)
         : undefined;
-      configPath = await writeGenerated(
-        project,
-        `${artifactRoot}/playwright.config.mjs`,
-        `export default ${JSON.stringify({ testDir: path.join(project, "e2e/aratame"), testMatch: "**/*.spec.mjs", timeout: 30000, fullyParallel: false, retries: 0, workers: 1, use: { baseURL: baseUrl, storageState, headless: true, trace: "on" } })};\n`,
-      );
+      configPath = await writeJobFile(project,
+      `${artifactRoot}/playwright.config.mjs`,
+      `export default ${JSON.stringify({ testDir: path.join(project, "e2e/aratame"), testMatch: "**/*.spec.mjs", timeout: 30000, fullyParallel: false, retries: 0, workers: 1, use: { baseURL: baseUrl, storageState, headless: true, trace: "on" } })};\n`,);
       return configPath;
     }
     const repairConfigs = new Map();
@@ -445,6 +540,7 @@ export async function executeJob(config, job, api, signal) {
       ];
       if (absolute) discoveryArgs.push("--config", absolute);
       if (item.specTag) discoveryArgs.push("--grep", escape(item.specTag));
+      await verifyInputs();
       const discovery = await processRun(process.execPath, discoveryArgs, {
         cwd: project,
         signal,
@@ -454,11 +550,9 @@ export async function executeJob(config, job, api, signal) {
           ...(baseUrl ? { ARATAME_BASE_URL: baseUrl } : {}),
         },
       });
-      await writeGenerated(
-        project,
-        `${artifactRoot}/${item.id}-repair-projects.log`,
-        discovery.output,
-      );
+      await writeJobFile(project,
+      `${artifactRoot}/${item.id}-repair-projects.log`,
+      discovery.output,);
       if (discovery.code !== 0 || discovery.timedOut)
         throw new Error(
           "Original Playwright project selection could not be discovered; inspect local repair-projects evidence",
@@ -477,69 +571,67 @@ export async function executeJob(config, job, api, signal) {
         );
       // Discover only direct execution projects. Dependencies and teardowns keep
       // their own files, fixtures and discovery rules; never run the repair as setup.
-      const repairConfigPath = await writeGenerated(
-        project,
-        `${artifactRoot}/${item.id}-repair.config.mjs`,
-        `
-${absolute ? `import original from ${JSON.stringify(pathToFileURL(absolute).href)};` : "const original = {};"}
-import path from 'node:path';
-import fs from 'node:fs';
-import { createRequire } from 'node:module';
-const root = ${JSON.stringify(root)};
-const originalSpec = ${JSON.stringify(originalSpec)};
-const candidate = ${JSON.stringify(path.join(project, specPath))};
-const selected = new Set(${JSON.stringify(selectedNames)});
-const metadata = ${JSON.stringify(discovered.config.projects)};
-const resolve = value => typeof value === 'string' ? path.resolve(root, value) : value;
-const rootTemplate = template => path.isAbsolute(template) ? template : root + path.sep + template;
-const resolveTemplate = template => /^\\{\\/?(?:testDir|snapshotDir)\\}/.test(template) ? template : rootTemplate(template);
-const legacyTemplate = '{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{-projectName}{-snapshotSuffix}{ext}';
-const ariaTemplate = '{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{ext}';
-function projectConfig(value) {
-  const name = value.name ?? original.name ?? '';
-  const effective = metadata.find(project => project.name === name);
-  if (!effective) throw new Error('Original project configuration changed during repair selection');
-  const snapshotDir = resolve(value.snapshotDir ?? original.snapshotDir) || effective.testDir;
-  const base = {...value, testDir: effective.testDir, outputDir: effective.outputDir, snapshotDir};
-  if (value.tsconfig) base.tsconfig = resolve(value.tsconfig);
-  const expectation = value.expect ?? original.expect ?? {};
-  const screenshot = expectation.toHaveScreenshot || {};
-  const stylePath = screenshot.stylePath;
-  const screenshotOptions = {...screenshot, ...(stylePath ? {stylePath: (Array.isArray(stylePath) ? stylePath : [stylePath]).map(resolve)} : {})};
-  base.expect = {...expectation, toHaveScreenshot: screenshotOptions};
-  if (!selected.has(name)) {
-    const template = value.snapshotPathTemplate ?? original.snapshotPathTemplate;
-    if (template) base.snapshotPathTemplate = resolveTemplate(template);
-    if (screenshot.pathTemplate) base.expect.toHaveScreenshot.pathTemplate = resolveTemplate(screenshot.pathTemplate);
-    if (expectation.toMatchAriaSnapshot?.pathTemplate)
-      base.expect.toMatchAriaSnapshot = {...expectation.toMatchAriaSnapshot, pathTemplate: resolveTemplate(expectation.toMatchAriaSnapshot.pathTemplate)};
-    return base;
-  }
-  const relative = path.relative(effective.testDir, originalSpec);
-  const tokens = {testDir: effective.testDir, snapshotDir, testFileDir: path.dirname(relative) === '.' ? '' : path.dirname(relative), testFileBaseName: path.parse(originalSpec).name, testFileName: path.basename(originalSpec), testFilePath: relative};
-  const relocateTemplate = template => rootTemplate(template.replace(/\\{(.)?(testDir|snapshotDir|testFileDir|testFileBaseName|testFileName|testFilePath)\\}/g, (_match, prefix, token) => (prefix || '') + tokens[token]));
-  const inheritedTemplate = value.snapshotPathTemplate ?? original.snapshotPathTemplate;
-  return {...base, testDir: ${JSON.stringify(project)}, testMatch: candidate, testIgnore: [],
-    snapshotPathTemplate: relocateTemplate(inheritedTemplate || legacyTemplate),
-    expect: {...base.expect,
-      toHaveScreenshot: {...screenshotOptions, pathTemplate: relocateTemplate(screenshot.pathTemplate || inheritedTemplate || legacyTemplate)},
-      toMatchAriaSnapshot: {...expectation.toMatchAriaSnapshot, pathTemplate: relocateTemplate(expectation.toMatchAriaSnapshot?.pathTemplate || inheritedTemplate || ariaTemplate)}
-    }
-  };
-}
-const require = createRequire(path.join(root, 'package.json'));
-const hook = id => fs.existsSync(resolve(id)) ? resolve(id) : require.resolve(id, {paths:[root]});
-const hooks = value => Array.isArray(value) ? value.map(hook) : hook(value);
-export default {
-  ...original,
-  ...(original.projects ? {testDir: resolve(original.testDir) || root, projects: original.projects.map(projectConfig)} : projectConfig(original)),
-  ...(original.tsconfig ? {tsconfig: resolve(original.tsconfig)} : {}),
-  ...(original.globalSetup ? {globalSetup: hooks(original.globalSetup)} : {}),
-  ...(original.globalTeardown ? {globalTeardown: hooks(original.globalTeardown)} : {}),
-  ...(original.webServer ? {webServer: (Array.isArray(original.webServer) ? original.webServer : [original.webServer]).map(server => ({...server, cwd: server.cwd ? resolve(server.cwd) : root}))} : {})
-};
-`,
-      );
+      const repairConfigPath = await writeJobFile(project,
+      `${artifactRoot}/${item.id}-repair.config.mjs`,
+      `
+      ${absolute ? `import original from ${JSON.stringify(pathToFileURL(absolute).href)};` : "const original = {};"}
+      import path from 'node:path';
+      import fs from 'node:fs';
+      import { createRequire } from 'node:module';
+      const root = ${JSON.stringify(root)};
+      const originalSpec = ${JSON.stringify(originalSpec)};
+      const candidate = ${JSON.stringify(path.join(project, specPath))};
+      const selected = new Set(${JSON.stringify(selectedNames)});
+      const metadata = ${JSON.stringify(discovered.config.projects)};
+      const resolve = value => typeof value === 'string' ? path.resolve(root, value) : value;
+      const rootTemplate = template => path.isAbsolute(template) ? template : root + path.sep + template;
+      const resolveTemplate = template => /^\\{\\/?(?:testDir|snapshotDir)\\}/.test(template) ? template : rootTemplate(template);
+      const legacyTemplate = '{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{-projectName}{-snapshotSuffix}{ext}';
+      const ariaTemplate = '{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{ext}';
+      function projectConfig(value) {
+        const name = value.name ?? original.name ?? '';
+        const effective = metadata.find(project => project.name === name);
+        if (!effective) throw new Error('Original project configuration changed during repair selection');
+        const snapshotDir = resolve(value.snapshotDir ?? original.snapshotDir) || effective.testDir;
+        const base = {...value, testDir: effective.testDir, outputDir: effective.outputDir, snapshotDir};
+        if (value.tsconfig) base.tsconfig = resolve(value.tsconfig);
+        const expectation = value.expect ?? original.expect ?? {};
+        const screenshot = expectation.toHaveScreenshot || {};
+        const stylePath = screenshot.stylePath;
+        const screenshotOptions = {...screenshot, ...(stylePath ? {stylePath: (Array.isArray(stylePath) ? stylePath : [stylePath]).map(resolve)} : {})};
+        base.expect = {...expectation, toHaveScreenshot: screenshotOptions};
+        if (!selected.has(name)) {
+          const template = value.snapshotPathTemplate ?? original.snapshotPathTemplate;
+          if (template) base.snapshotPathTemplate = resolveTemplate(template);
+          if (screenshot.pathTemplate) base.expect.toHaveScreenshot.pathTemplate = resolveTemplate(screenshot.pathTemplate);
+          if (expectation.toMatchAriaSnapshot?.pathTemplate)
+            base.expect.toMatchAriaSnapshot = {...expectation.toMatchAriaSnapshot, pathTemplate: resolveTemplate(expectation.toMatchAriaSnapshot.pathTemplate)};
+          return base;
+        }
+        const relative = path.relative(effective.testDir, originalSpec);
+        const tokens = {testDir: effective.testDir, snapshotDir, testFileDir: path.dirname(relative) === '.' ? '' : path.dirname(relative), testFileBaseName: path.parse(originalSpec).name, testFileName: path.basename(originalSpec), testFilePath: relative};
+        const relocateTemplate = template => rootTemplate(template.replace(/\\{(.)?(testDir|snapshotDir|testFileDir|testFileBaseName|testFileName|testFilePath)\\}/g, (_match, prefix, token) => (prefix || '') + tokens[token]));
+        const inheritedTemplate = value.snapshotPathTemplate ?? original.snapshotPathTemplate;
+        return {...base, testDir: ${JSON.stringify(project)}, testMatch: candidate, testIgnore: [],
+          snapshotPathTemplate: relocateTemplate(inheritedTemplate || legacyTemplate),
+          expect: {...base.expect,
+            toHaveScreenshot: {...screenshotOptions, pathTemplate: relocateTemplate(screenshot.pathTemplate || inheritedTemplate || legacyTemplate)},
+            toMatchAriaSnapshot: {...expectation.toMatchAriaSnapshot, pathTemplate: relocateTemplate(expectation.toMatchAriaSnapshot?.pathTemplate || inheritedTemplate || ariaTemplate)}
+          }
+        };
+      }
+      const require = createRequire(path.join(root, 'package.json'));
+      const hook = id => fs.existsSync(resolve(id)) ? resolve(id) : require.resolve(id, {paths:[root]});
+      const hooks = value => Array.isArray(value) ? value.map(hook) : hook(value);
+      export default {
+        ...original,
+        ...(original.projects ? {testDir: resolve(original.testDir) || root, projects: original.projects.map(projectConfig)} : projectConfig(original)),
+        ...(original.tsconfig ? {tsconfig: resolve(original.tsconfig)} : {}),
+        ...(original.globalSetup ? {globalSetup: hooks(original.globalSetup)} : {}),
+        ...(original.globalTeardown ? {globalTeardown: hooks(original.globalTeardown)} : {}),
+        ...(original.webServer ? {webServer: (Array.isArray(original.webServer) ? original.webServer : [original.webServer]).map(server => ({...server, cwd: server.cwd ? resolve(server.cwd) : root}))} : {})
+      };
+      `,);
       repairConfigs.set(item.id, repairConfigPath);
       return repairConfigPath;
     }
@@ -580,7 +672,7 @@ export default {
           signal.throwIfAborted();
           const specPath = proposal.proposedSpecPath;
           try {
-            await writeGenerated(project, specPath, repaired);
+            await writeJobFile(project, specPath, repaired);
           } catch (error) {
             if (error.code !== "EEXIST") throw error;
             const candidate = await safePath(project, specPath);
@@ -665,6 +757,7 @@ export default {
               throw new Error(
                 "Original script changed after the failed execution",
               );
+            await verifyInputs();
             const { proposal, evidence } = await exploreRepairCase({
               config,
               job,
@@ -747,6 +840,7 @@ export default {
             }
           } catch {}
         }
+        await verifyInputs();
         if (!artifact)
           artifact = await exploreCase({
             config,
@@ -761,11 +855,9 @@ export default {
         // All generated assertions are reviewed before publishing automation links.
         const specPath = `e2e/aratame/${item.id}-v${item.version}-${run.id}.spec.mjs`;
         const specTag = `aratame:${item.id}:v${item.version}`;
-        await writeGenerated(
-          project,
-          specPath,
-          compileScenario(artifact, item, baseUrl),
-        );
+        await writeJobFile(project,
+        specPath,
+        compileScenario(artifact, item, baseUrl),);
         generated.push({
           item,
           artifact,
@@ -858,6 +950,7 @@ export default {
             detail: result.detail,
           });
       }
+    await verifyInputs();
     const status = reviews.length
       ? "review"
       : results.some((r) => r.status === "blocked" || r.status === "not_run")
@@ -872,32 +965,46 @@ export default {
       reviews,
       repairs,
       status,
+      ...(publishedRevision ? { publishedRevision } : {}),
+      ...(candidateRevision ? { candidateRevision } : {}),
+      ...(job.supportingFiles ? { supportingFileRevisions } : {}),
       logs: logs.join("\n").slice(-90_000),
     };
-    await writeGenerated(
-      project,
-      `${artifactRoot}/result.json`,
-      JSON.stringify(report, null, 2),
-    );
+    await writeJobFile(project,
+    `${artifactRoot}/result.json`,
+    JSON.stringify(report, null, 2),);
     return { ...report, localReceipt };
   } catch (error) {
+    if (supportingFileRevisions !== undefined) {
+      try {
+        await verifyInputs();
+      } catch (verificationError) {
+        supportingFileRevisions = undefined;
+        for (const result of results) {
+          result.status = "blocked";
+          result.detail = `Published/supporting inputs changed; execution cannot be certified: ${verificationError.message}`;
+        }
+      }
+    }
     error.partialReport = {
       results,
       reviews,
       repairs,
       status: "blocked",
+      ...(publishedRevision ? { publishedRevision } : {}),
+      ...(candidateRevision ? { candidateRevision } : {}),
+      ...(job.supportingFiles && supportingFileRevisions !== undefined ? { supportingFileRevisions } : {}),
       logs: logs.join("\n").slice(-90_000),
     };
     try {
-      await writeGenerated(
-        project,
-        `${artifactRoot}/interrupted-result.json`,
-        JSON.stringify(
-          { ...error.partialReport, error: error.message },
-          null,
-          2,
-        ),
-      );
+      if (!inputsVerified) throw error;
+      await writeJobFile(project,
+      `${artifactRoot}/interrupted-result.json`,
+      JSON.stringify(
+        { ...error.partialReport, error: error.message },
+        null,
+        2,
+      ),);
     } catch {
       // Preserve the execution error even if the filesystem is no longer writable.
     }

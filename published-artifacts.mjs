@@ -1,0 +1,191 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { createHash } from "node:crypto";
+import { z } from "zod";
+
+const exec = promisify(execFile);
+const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
+const text = z.string().min(1).max(2000);
+const identity = z.string().min(1).max(200);
+export const artifactPathSchema = z.string().min(1).max(500).refine(
+  (value) => !path.isAbsolute(value) && !value.includes("\\") &&
+    !/[\u0000-\u001f\u007f:]/.test(value) &&
+    value.split("/").every((part) => part && part !== "." && part !== ".." && part.toLowerCase() !== ".git"),
+  "Use an ordinary project-relative path without traversal",
+);
+const origin = z.enum(["generated", "authored"]);
+const fileSchema = z.object({
+  path: artifactPathSchema, sha256,
+  kind: z.enum(["knowledge", "conventions", "provenance", "script", "fixture", "test-definition"]),
+  origin,
+}).strict();
+const historySchema = z.object({ id: identity, path: artifactPathSchema, updatedAt: text }).strict();
+const knowledgeSchema = z.object({
+  id: identity, title: z.string().min(1).max(300), surface: z.string().min(1).max(120),
+  path: artifactPathSchema, origin,
+  citations: z.array(text).max(1000),
+  sourceVersions: z.record(identity, text).refine((value) => Object.keys(value).length <= 1000),
+  gaps: z.array(text).max(100), history: z.array(historySchema).max(200),
+}).strict();
+const sourceSchema = z.object({
+  id: identity, title: z.string().min(1).max(500), source: text,
+  sourceUrl: z.string().url().max(2000).refine((value) => {
+    const url = new URL(value);
+    return ["https:", "http:"].includes(url.protocol) && !url.username && !url.password;
+  }).optional(),
+  updatedAt: text, sha256, retention: z.literal("cloud"), snapshotId: identity,
+}).strict();
+const caseSchema = z.object({
+  id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/),
+  version: z.number().int().positive(), title: z.string().min(3).max(300),
+  surface: z.string().min(1).max(120), category: z.enum(["smoke", "functional", "edge", "regression"]),
+  priority: z.enum(["P0", "P1", "P2"]), preconditions: z.string().min(1).max(4000),
+  steps: z.array(z.string().min(1).max(2000)).min(1).max(30), expected: z.string().min(3).max(4000),
+  sourceIssues: z.array(text).max(1000), specPath: artifactPathSchema.optional(),
+  specTag: z.string().min(1).max(200).refine((value) => !/[\u0000-\u001f\u007f]/.test(value)).optional(),
+  sha256: sha256.optional(),
+  history: z.array(z.object({ id: identity, version: z.number().int().positive() }).strict()).max(200).optional(),
+}).strict();
+export const artifactManifestSchema = z.object({
+  schemaVersion: z.literal(1), kind: z.literal("aratame-artifacts"),
+  files: z.array(fileSchema).max(500), knowledge: z.array(knowledgeSchema).max(200),
+  sources: z.array(sourceSchema).max(1000), cases: z.array(caseSchema).max(200),
+}).strict().superRefine((manifest, ctx) => {
+  const issue = (message) => ctx.addIssue({ code: "custom", message });
+  for (const [items, key] of [[manifest.files, "path"], [manifest.knowledge, "id"], [manifest.sources, "id"], [manifest.cases, "id"]]) {
+    if (new Set(items.map((item) => item[key])).size !== items.length) issue(`Duplicate ${key}`);
+  }
+  const files = new Map(manifest.files.map((file) => [file.path, file]));
+  for (const page of manifest.knowledge) {
+    const file = files.get(page.path);
+    if (file?.kind !== "knowledge" || file.origin !== page.origin) issue(`Knowledge file missing or ownership differs: ${page.path}`);
+    for (const previous of page.history) {
+      if (files.get(previous.path)?.kind !== "knowledge") issue(`History file missing: ${previous.path}`);
+    }
+  }
+  for (const item of manifest.cases) {
+    if (!item.specPath && (item.specTag || item.sha256)) issue(`Script metadata requires specPath: ${item.id}`);
+    if (item.specPath) {
+      const file = files.get(item.specPath);
+      if (file?.kind !== "script" || !item.sha256 || file.sha256 !== item.sha256) issue(`Script file/hash missing or different: ${item.id}`);
+      if (!/\.(spec|test)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$/.test(item.specPath)) issue(`Invalid spec path: ${item.id}`);
+    }
+  }
+});
+export const artifactRevisionSchema = z.object({
+  repository: z.string().min(3).max(2000).refine((value) => {
+    try { repositoryIdentity(value); return true; } catch { return false; }
+  }, "Use owner/repository or a credential-free Git remote URL"),
+  commitSha: z.string().regex(/^[a-f0-9]{40}$/),
+  manifestPath: artifactPathSchema,
+  manifestSha256: sha256,
+}).strict();
+
+function repositoryIdentity(value) {
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) return `github.com/${value.replace(/\.git$/, "").toLowerCase()}`;
+  const scp = /^git@([^/:\s]+):([^\s]+)$/.exec(value);
+  const url = new URL(scp ? `ssh://git@${scp[1]}/${scp[2]}` : value.replace(/^git\+/, ""));
+  if (!["https:", "ssh:"].includes(url.protocol) || url.password || url.search || url.hash || (url.username && !(url.protocol === "ssh:" && url.username === "git"))) throw new Error("Unsafe repository identity");
+  if (!/^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(url.pathname)) throw new Error("Repository must identify owner/name");
+  const repositoryPath = url.pathname.slice(1).replace(/\.git$/, "");
+  return `${url.host.toLowerCase()}/${url.hostname.toLowerCase() === "github.com" ? repositoryPath.toLowerCase() : repositoryPath}`;
+}
+async function git(project, args, encoding = "utf8") {
+  const { stdout } = await exec("git", ["-c", "core.fsmonitor=false", "-C", project, ...args], {
+    encoding, maxBuffer: 20_000_000, timeout: 30_000,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_NO_REPLACE_OBJECTS: "1" },
+  });
+  return stdout;
+}
+async function ordinaryFile(project, relative, maxBytes) {
+  let current = project;
+  for (const part of artifactPathSchema.parse(relative).split("/")) {
+    current = path.join(current, part);
+    const stat = await fs.lstat(current);
+    if (stat.isSymbolicLink()) throw new Error(`Symlink input forbidden: ${relative}`);
+  }
+  const stat = await fs.stat(current);
+  if (!stat.isFile() || stat.size > maxBytes) throw new Error(`Input is not a bounded ordinary file: ${relative}`);
+  const bytes = await fs.readFile(current);
+  if (bytes.length > maxBytes) throw new Error(`Input exceeds file budget: ${relative}`);
+  return bytes;
+}
+async function checkout(projectDir, revision, { localFiles = [], outputDirectories = [] } = {}) {
+  const project = path.resolve(projectDir);
+  if (await fs.realpath(project) !== project) throw new Error("Published project path must not contain symlinks");
+  if (path.resolve((await git(project, ["rev-parse", "--show-toplevel"])).trim()) !== project) throw new Error("Published project must be the repository root");
+  const remote = (await git(project, ["remote", "get-url", "origin"])).trim();
+  if (repositoryIdentity(remote) !== repositoryIdentity(revision.repository)) throw new Error("Published repository differs from checkout origin");
+  if ((await git(project, ["rev-parse", "HEAD"])).trim() !== revision.commitSha) throw new Error("Published commit differs from checkout HEAD; prepare the exact checkout explicitly");
+  const flags = (await git(project, ["ls-files", "-v", "-z"])).split("\0");
+  if (flags.some((entry) => entry && entry[0] !== "H")) throw new Error("Published checkout cannot use hidden, unmerged, or sparse index entries");
+  const dirty = await git(project, ["status", "--porcelain=v1", "--untracked-files=no", "--ignore-submodules=none"]);
+  if (dirty.trim()) throw new Error("Published checkout has tracked modifications");
+  const allowed = z.array(z.object({ path: artifactPathSchema, sha256 }).strict()).max(1000).parse(localFiles);
+  const directories = z.array(artifactPathSchema.refine((value) => /^e2e\/aratame\/\.artifacts\/[A-Za-z0-9_-]+$/.test(value), "Only an explicit per-run Toolkit artifact directory may be allowed")).max(1).parse(outputDirectories);
+  const allowedByPath = new Map(allowed.map((file) => [file.path, file.sha256]));
+  if (allowedByPath.size !== allowed.length) throw new Error("Duplicate local input allowance");
+  for (const file of allowed) {
+    let bytes;
+    try {
+      bytes = await ordinaryFile(project, file.path, 2_000_000);
+    } catch (error) {
+      throw new Error(`Explicit local input missing or unsafe: ${file.path}`, { cause: error });
+    }
+    if (hash(bytes) !== file.sha256) throw new Error(`Explicit local input changed: ${file.path}`);
+  }
+  // Omitting --exclude-standard deliberately includes ignored overlays too.
+  const overlays = (await git(project, ["ls-files", "--others", "-z", "--", ".", ":(exclude)node_modules", ":(exclude)**/node_modules"])).split("\0").filter(Boolean);
+  for (const relative of overlays) {
+    if (directories.some((directory) => relative.startsWith(`${directory}/`))) continue;
+    const expected = allowedByPath.get(relative);
+    if (!expected) throw new Error(`Untracked or ignored input can shadow the published checkout: ${relative}`);
+  }
+  return project;
+}
+async function committedFile(project, revision, relative, maxBytes) {
+  const bytes = await ordinaryFile(project, relative, maxBytes);
+  const entry = (await git(project, ["ls-tree", "-z", revision.commitSha, "--", relative])).split("\0").filter(Boolean);
+  if (entry.length !== 1 || !/^100(644|755) blob [a-f0-9]{40}\t/.test(entry[0]) || entry[0].slice(entry[0].indexOf("\t") + 1) !== relative) throw new Error(`Published input is missing or not a committed ordinary file: ${relative}`);
+  const object = entry[0].split(" ")[2].split("\t")[0];
+  const committed = await git(project, ["cat-file", "blob", object], "buffer");
+  if (!bytes.equals(committed)) throw new Error(`Published file differs from commit: ${relative}`);
+  return bytes;
+}
+export async function readPublishedArtifacts({ projectDir, revision: expected, localFiles = [], outputDirectories = [] }) {
+  const revision = artifactRevisionSchema.parse(expected);
+  const allowances = { localFiles, outputDirectories };
+  const project = await checkout(projectDir, revision, allowances);
+  const raw = await committedFile(project, revision, revision.manifestPath, 2_000_000);
+  if (hash(raw) !== revision.manifestSha256) throw new Error("Published manifest hash differs from approved revision");
+  const manifest = artifactManifestSchema.parse(JSON.parse(raw.toString("utf8")));
+  if (manifest.files.some((file) => file.path === revision.manifestPath)) throw new Error("Manifest cannot list itself");
+  if (outputDirectories.some((directory) => [revision.manifestPath, ...manifest.files.map((file) => file.path)].some((filename) => filename === directory || filename.startsWith(`${directory}/`))))
+    throw new Error("Toolkit output directory overlaps a manifest-pinned path");
+  let total = 0;
+  const files = [];
+  for (const entry of manifest.files) {
+    const bytes = await committedFile(project, revision, entry.path, 1_000_000);
+    total += bytes.length;
+    if (total > 10_000_000) throw new Error("Published files exceed 10 MB budget");
+    if (hash(bytes) !== entry.sha256) throw new Error(`Published file hash differs: ${entry.path}`);
+    files.push({ ...entry, content: bytes.toString("utf8") });
+  }
+  await checkout(projectDir, revision, allowances);
+  const byPath = new Map(files.map((entry) => [entry.path, entry.content]));
+  return { manifest, revision, knowledge: manifest.knowledge.map((entry) => ({ ...entry, content: byPath.get(entry.path) })), cases: manifest.cases, files };
+}
+export async function verifyPublishedCheckout(options) {
+  return await readPublishedArtifacts(options);
+}
+// Resolves only operator-specified local bytes. No fetch, branch switch, or credentials.
+export async function resolvePublishedRevision({ projectDir, repository, commitSha, manifestPath = "aratame/knowledge/manifest.json", localFiles = [], outputDirectories = [] }) {
+  const revision = artifactRevisionSchema.parse({ repository, commitSha, manifestPath, manifestSha256: "0".repeat(64) });
+  const project = await checkout(projectDir, revision, { localFiles, outputDirectories });
+  revision.manifestSha256 = hash(await committedFile(project, revision, manifestPath, 2_000_000));
+  await readPublishedArtifacts({ projectDir, revision, localFiles, outputDirectories });
+  return revision;
+}
