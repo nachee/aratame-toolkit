@@ -7,14 +7,14 @@ import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { artifactManifestSchema, readPublishedArtifacts } from "./published-artifacts.mjs";
+import { artifactManifestSchema, readPublishedArtifacts, resolvePublishedOriginal } from "./published-artifacts.mjs";
 import { executeJob } from "./execution.mjs";
 import { standalone } from "./standalone.mjs";
 
 const exec = promisify(execFile);
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const cli = fileURLToPath(new URL("./cli.mjs", import.meta.url));
-async function fixture(t, { mixed = false, mutate = false } = {}) {
+async function fixture(t, { mixed = false, mutate = false, retention = "cloud", schemaVersion = 2, gaps = ["Authentication setup remains operator-owned"] } = {}) {
   const project = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "aratame-published-")));
   t.after(() => fs.rm(project, { recursive: true, force: true }));
   const marker = `${project}-fixture-ran`;
@@ -29,10 +29,21 @@ async function fixture(t, { mixed = false, mutate = false } = {}) {
   await put("config.json", JSON.stringify({ baseUrl: "http://127.0.0.1:3000", fixture: [process.execPath, "fixtures/reset.mjs", marker] }));
   const contents = {
     "aratame/knowledge/pages/inbox.md": "# Inbox\nEmpty accounts show No messages. [ISSUE-1]\n",
-    "aratame/knowledge/CONVENTIONS.md": "# Conventions v1\nPages are synthesis, not original evidence.\n",
+    "aratame/knowledge/CONVENTIONS.md": "# Conventions\nPages are synthesis, not original evidence.\n",
     "aratame/knowledge/provenance.json": '{"retention":"cloud","originals":"not exported"}\n',
   };
   const kinds = ["knowledge", "conventions", "provenance"];
+  const originalContent = "original retained separately";
+  const source = { id: "ISSUE-1", title: "Empty inbox contract", source: "linear", updatedAt: "2026-09-11T00:00:00Z", sha256: digest(originalContent), retention };
+  if (retention === "cloud") source.snapshotId = "snapshot-1";
+  else {
+    Object.assign(source, { sourceIdentity: "linear-issue-1", ingestedAt: source.updatedAt, upstreamVersion: "2026-09-10T12:00:00Z" });
+    if (retention === "repository") {
+      source.path = "aratame/sources/linear-issue-1.txt";
+      contents[source.path] = originalContent;
+      kinds.push("source-snapshot");
+    }
+  }
   let cases = [];
   if (mixed) {
     contents["fixtures/baseline.json"] = '{"message":"No messages"}\n';
@@ -47,10 +58,10 @@ test('empty inbox', async () => {
     cases = [{ id: "inbox", version: 3, title: "Empty inbox", surface: "inbox", category: "functional", priority: "P1", preconditions: "An empty account", steps: ["Open the inbox"], expected: "No messages is visible", sourceIssues: ["ISSUE-1"], specPath: "tests/inbox.spec.mjs", sha256: digest(contents["tests/inbox.spec.mjs"]), history: [{ id: "inbox", version: 2 }] }];
   }
   const manifest = {
-    schemaVersion: 1, kind: "aratame-artifacts",
+    schemaVersion, kind: "aratame-artifacts",
     files: Object.entries(contents).map(([name, content], index) => ({ path: name, sha256: digest(content), kind: kinds[index], origin: kinds[index] === "fixture" ? "authored" : "generated" })),
-    knowledge: [{ id: "inbox-guide", title: "Inbox", surface: "inbox", path: "aratame/knowledge/pages/inbox.md", origin: "generated", citations: ["ISSUE-1"], sourceVersions: { "ISSUE-1": "2026-09-11T00:00:00Z" }, gaps: ["Authentication setup remains operator-owned"], history: [] }],
-    sources: [{ id: "ISSUE-1", title: "Empty inbox contract", source: "linear", updatedAt: "2026-09-11T00:00:00Z", sha256: digest("original retained separately"), retention: "cloud", snapshotId: "snapshot-1" }], cases,
+    knowledge: [{ id: "inbox-guide", title: "Inbox", surface: "inbox", path: "aratame/knowledge/pages/inbox.md", origin: "generated", citations: ["ISSUE-1"], sourceVersions: { "ISSUE-1": "2026-09-11T00:00:00Z" }, gaps, history: [] }],
+    sources: [source], cases,
   };
   for (const [name, content] of Object.entries(contents)) await put(name, content);
   const manifestPath = "aratame/knowledge/manifest.json";
@@ -81,6 +92,55 @@ test("KB-only published files retain source references and remain credential-fre
   await assert.rejects(readPublishedArtifacts({ projectDir: f.project, revision: { ...f.revision, manifestSha256: "0".repeat(64) } }), /manifest hash differs/);
 });
 
+test("immutable v1 remains readable but cannot describe repository or references-only originals", async (t) => {
+  const f = await fixture(t, { schemaVersion: 1 });
+  const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+  assert.equal(artifacts.manifest.schemaVersion, 1);
+  assert.equal(resolvePublishedOriginal(artifacts, "ISSUE-1").status, "unavailable");
+  assert.equal(artifactManifestSchema.safeParse({ ...f.manifest, sources: [{ ...f.manifest.sources[0], retention: "references", sourceIdentity: "issue", ingestedAt: "now", upstreamVersion: "v1" }] }).success, false);
+});
+
+test("repository originals resolve exact verified bytes independently of mutable consumer objects", async (t) => {
+  const f = await fixture(t, { retention: "repository" });
+  const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+  const original = resolvePublishedOriginal(artifacts, "ISSUE-1");
+  assert.equal(original.status, "exact");
+  assert.equal(original.content, "original retained separately");
+  artifacts.files.find((file) => file.kind === "source-snapshot").content = "tampered consumer copy";
+  artifacts.manifest.sources[0].sha256 = digest("tampered consumer copy");
+  assert.deepEqual(resolvePublishedOriginal(artifacts, "ISSUE-1"), original);
+  assert.throws(() => resolvePublishedOriginal(structuredClone(artifacts), "ISSUE-1"), /requires artifacts/);
+  await f.put(f.manifest.sources[0].path, "changed file");
+  await assert.rejects(readPublishedArtifacts({ projectDir: f.project, revision: f.revision }), /tracked modifications/);
+});
+
+test("v2 source locators are exclusive and repository hashes and citation versions must agree", async (t) => {
+  const f = await fixture(t, { retention: "repository" });
+  const source = f.manifest.sources[0];
+  for (const invalid of [
+    { ...f.manifest, sources: [{ ...source, snapshotId: "hidden-cloud-copy" }] },
+    { ...f.manifest, sources: [{ ...source, sha256: "0".repeat(64) }] },
+    { ...f.manifest, files: f.manifest.files.filter((file) => file.kind !== "source-snapshot") },
+    { ...f.manifest, sources: [] },
+    { ...f.manifest, knowledge: [{ ...f.manifest.knowledge[0], sourceVersions: { "ISSUE-1": "different-revision" } }] },
+  ]) assert.equal(artifactManifestSchema.safeParse(invalid).success, false);
+});
+
+test("references resolve only explicit matching bytes and version, without network or historical substitution", async (t) => {
+  const f = await fixture(t, { retention: "references" });
+  const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+  t.mock.method(globalThis, "fetch", () => { throw new Error("Original helper must remain offline"); });
+  assert.equal(resolvePublishedOriginal(artifacts, "ISSUE-1").status, "unavailable");
+  const version = f.manifest.sources[0].upstreamVersion;
+  for (const supplied of [{ content: "changed", upstreamVersion: version }, { content: "original retained separately", upstreamVersion: "changed-version" }, { content: "original retained separately" }]) {
+    const result = resolvePublishedOriginal(artifacts, "ISSUE-1", supplied);
+    assert.equal(result.status, "changed");
+    assert.equal(result.content, undefined);
+  }
+  assert.equal(resolvePublishedOriginal(artifacts, "ISSUE-1", { content: "original retained separately", upstreamVersion: version }).content, "original retained separately");
+  assert.equal(artifactManifestSchema.safeParse({ ...f.manifest, sources: [{ ...f.manifest.sources[0], path: "hidden.txt" }] }).success, false);
+});
+
 test("wrong commit and changed declared fixture stop before the operator fixture runs", async (t) => {
   const f = await fixture(t, { mixed: true });
   const config = { project: f.project, fixture: [process.execPath, "fixtures/reset.mjs", f.marker] };
@@ -104,6 +164,21 @@ test("missing, symlink and hidden-index inputs cannot attest a published checkou
   await assert.rejects(readPublishedArtifacts({ projectDir: f.project, revision: f.revision }), /tracked modifications|Symlink/);
   await f.git("update-index", "--assume-unchanged", "fixtures/baseline.json");
   await assert.rejects(readPublishedArtifacts({ projectDir: f.project, revision: f.revision }), /hidden.*index/);
+});
+
+test("offline originals do not consume the full published gap allowance during standalone import", async (t) => {
+  const gaps = Array.from({ length: 100 }, (_, index) => `Case ${index + 1} requires an operator-defined baseline.`);
+  for (const schemaVersion of [1, 2]) await t.test(`immutable schema ${schemaVersion}`, async (t) => {
+    const f = await fixture(t, { mixed: true, schemaVersion, gaps });
+    const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+    assert.equal(resolvePublishedOriginal(artifacts, "ISSUE-1").status, "unavailable");
+    await exec(process.execPath, [cli, "plan", "--project", f.project, "--config", "config.json", "--repository", f.revision.repository, "--commit", f.revision.commitSha], { cwd: f.project, timeout: 60_000 });
+    const plan = JSON.parse(await fs.readFile(path.join(f.project, "e2e/aratame/plan.json"), "utf8"));
+    assert.deepEqual(plan.gaps, gaps);
+    assert.deepEqual(plan.cases, f.manifest.cases);
+    assert.deepEqual(plan.publishedRevision, f.revision);
+    await assert.rejects(fs.access(f.marker), { code: "ENOENT" });
+  });
 });
 
 test("mixed customer checkout imports exact cases through CLI, requires approval and runs portable fixtures without Cloud or models", async (t) => {

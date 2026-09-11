@@ -22,6 +22,9 @@ const fileSchema = z.object({
   kind: z.enum(["knowledge", "conventions", "provenance", "script", "fixture", "test-definition"]),
   origin,
 }).strict();
+const sourceFileSchema = fileSchema.extend({
+  kind: z.enum(["knowledge", "conventions", "provenance", "script", "fixture", "test-definition", "source-snapshot"]),
+});
 const historySchema = z.object({ id: identity, path: artifactPathSchema, updatedAt: text }).strict();
 const knowledgeSchema = z.object({
   id: identity, title: z.string().min(1).max(300), surface: z.string().min(1).max(120),
@@ -38,6 +41,16 @@ const sourceSchema = z.object({
   }).optional(),
   updatedAt: text, sha256, retention: z.literal("cloud"), snapshotId: identity,
 }).strict();
+const sourceMetadata = sourceSchema.omit({ retention: true, snapshotId: true }).extend({
+  sourceIdentity: text.optional(), ingestedAt: text.optional(), upstreamVersion: text.optional(),
+});
+const portableSourceSchema = z.discriminatedUnion("retention", [
+  sourceMetadata.extend({ retention: z.literal("cloud"), snapshotId: identity }).strict(),
+  sourceMetadata.extend({ retention: z.literal("repository"), path: artifactPathSchema }).strict(),
+  sourceMetadata.extend({
+    retention: z.literal("references"), sourceIdentity: text, ingestedAt: text, upstreamVersion: text,
+  }).strict(),
+]);
 const caseSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/),
   version: z.number().int().positive(), title: z.string().min(3).max(300),
@@ -49,11 +62,15 @@ const caseSchema = z.object({
   sha256: sha256.optional(),
   history: z.array(z.object({ id: identity, version: z.number().int().positive() }).strict()).max(200).optional(),
 }).strict();
-export const artifactManifestSchema = z.object({
-  schemaVersion: z.literal(1), kind: z.literal("aratame-artifacts"),
-  files: z.array(fileSchema).max(500), knowledge: z.array(knowledgeSchema).max(200),
-  sources: z.array(sourceSchema).max(1000), cases: z.array(caseSchema).max(200),
-}).strict().superRefine((manifest, ctx) => {
+const manifestShape = {
+  kind: z.literal("aratame-artifacts"),
+  knowledge: z.array(knowledgeSchema).max(200), cases: z.array(caseSchema).max(200),
+};
+export const artifactManifestSchema = z.discriminatedUnion("schemaVersion", [
+  // Immutable historical commits remain readable; producers use version 2.
+  z.object({ ...manifestShape, schemaVersion: z.literal(1), files: z.array(fileSchema).max(500), sources: z.array(sourceSchema).max(1000) }).strict(),
+  z.object({ ...manifestShape, schemaVersion: z.literal(2), files: z.array(sourceFileSchema).max(500), sources: z.array(portableSourceSchema).max(1000) }).strict(),
+]).superRefine((manifest, ctx) => {
   const issue = (message) => ctx.addIssue({ code: "custom", message });
   for (const [items, key] of [[manifest.files, "path"], [manifest.knowledge, "id"], [manifest.sources, "id"], [manifest.cases, "id"]]) {
     if (new Set(items.map((item) => item[key])).size !== items.length) issue(`Duplicate ${key}`);
@@ -65,6 +82,22 @@ export const artifactManifestSchema = z.object({
     for (const previous of page.history) {
       if (files.get(previous.path)?.kind !== "knowledge") issue(`History file missing: ${previous.path}`);
     }
+    if (manifest.schemaVersion === 2) {
+      for (const id of page.citations) if (!Object.hasOwn(page.sourceVersions, id)) issue(`Citation lacks original revision: ${id}`);
+      for (const [id, version] of Object.entries(page.sourceVersions)) {
+        if (!manifest.sources.some((source) => source.id === id && source.updatedAt === version)) issue(`Original revision missing: ${id}`);
+      }
+    }
+  }
+  if (manifest.schemaVersion === 2) {
+    const snapshots = new Set();
+    for (const source of manifest.sources) if (source.retention === "repository") {
+      const file = files.get(source.path);
+      if (file?.kind !== "source-snapshot" || file.sha256 !== source.sha256) issue(`Source snapshot file/hash missing or different: ${source.id}`);
+      if (snapshots.has(source.path)) issue(`Source snapshot path is shared by different originals: ${source.path}`);
+      snapshots.add(source.path);
+    }
+    for (const file of manifest.files) if (file.kind === "source-snapshot" && !snapshots.has(file.path)) issue(`Source snapshot lacks provenance: ${file.path}`);
   }
   for (const item of manifest.cases) {
     if (!item.specPath && (item.specTag || item.sha256)) issue(`Script metadata requires specPath: ${item.id}`);
@@ -155,6 +188,7 @@ async function committedFile(project, revision, relative, maxBytes) {
   if (!bytes.equals(committed)) throw new Error(`Published file differs from commit: ${relative}`);
   return bytes;
 }
+const verifiedOriginals = new WeakMap();
 export async function readPublishedArtifacts({ projectDir, revision: expected, localFiles = [], outputDirectories = [] }) {
   const revision = artifactRevisionSchema.parse(expected);
   const allowances = { localFiles, outputDirectories };
@@ -176,7 +210,10 @@ export async function readPublishedArtifacts({ projectDir, revision: expected, l
   }
   await checkout(projectDir, revision, allowances);
   const byPath = new Map(files.map((entry) => [entry.path, entry.content]));
-  return { manifest, revision, knowledge: manifest.knowledge.map((entry) => ({ ...entry, content: byPath.get(entry.path) })), cases: manifest.cases, files };
+  const artifacts = { manifest, revision, knowledge: manifest.knowledge.map((entry) => ({ ...entry, content: byPath.get(entry.path) })), cases: manifest.cases, files };
+  // Keep the verified authority separate from mutable consumer-facing objects.
+  verifiedOriginals.set(artifacts, { sources: structuredClone(manifest.sources), files: new Map(files.filter((entry) => entry.kind === "source-snapshot").map((entry) => [entry.path, entry.content])) });
+  return artifacts;
 }
 export async function verifyPublishedCheckout(options) {
   return await readPublishedArtifacts(options);
@@ -188,4 +225,24 @@ export async function resolvePublishedRevision({ projectDir, repository, commitS
   revision.manifestSha256 = hash(await committedFile(project, revision, manifestPath, 2_000_000));
   await readPublishedArtifacts({ projectDir, revision, localFiles, outputDirectories });
   return revision;
+}
+
+/** Resolve only verified repository bytes or an explicitly supplied original; never fetch. */
+export function resolvePublishedOriginal(artifacts, sourceId, suppliedOriginal) {
+  const verified = verifiedOriginals.get(artifacts);
+  if (!verified) throw new Error("Original resolution requires artifacts from readPublishedArtifacts");
+  const source = verified.sources.find((entry) => entry.id === sourceId);
+  if (!source) throw new Error(`Unknown published original: ${sourceId}`);
+  const result = { id: source.id, retention: source.retention, sha256: source.sha256, ...(source.sourceUrl ? { sourceUrl: source.sourceUrl } : {}), ...(source.upstreamVersion ? { upstreamVersion: source.upstreamVersion } : {}) };
+  if (source.retention === "repository") {
+    const content = verified.files.get(source.path);
+    if (content === undefined || hash(content) !== source.sha256) return { ...result, status: "unavailable", detail: "The exact repository snapshot is unavailable." };
+    return { ...result, status: "exact", content, detail: "Exact original from the verified pinned repository snapshot." };
+  }
+  if (suppliedOriginal !== undefined) {
+    const supplied = z.object({ content: z.string().refine((value) => Buffer.byteLength(value) <= 1_000_000), upstreamVersion: text.optional() }).strict().parse(suppliedOriginal);
+    if (hash(supplied.content) !== source.sha256 || (source.upstreamVersion && supplied.upstreamVersion !== source.upstreamVersion)) return { ...result, status: "changed", detail: "Supplied bytes or upstream version differ from the published original; no historical body is returned." };
+    return { ...result, status: "exact", content: supplied.content, detail: "Explicitly supplied original matches the published hash and upstream version." };
+  }
+  return { ...result, status: "unavailable", detail: source.retention === "cloud" ? "Exact original requires protected Cloud access or an explicitly supplied verified export." : "Original requires continuing upstream access and an explicitly supplied matching version; a reference cannot reconstruct historical text." };
 }
