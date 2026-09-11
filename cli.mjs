@@ -13,6 +13,7 @@ const capabilities = [
   "restricted-browser-authoring",
   "script-revisions-v1",
   "linked-repair-v1",
+  "published-artifacts-v1",
 ];
 
 const help = `Aratame QA toolkit — local-first, no Aratame account required
@@ -23,9 +24,15 @@ Standalone (file paths are relative to --project):
   aratame run --project . --config aratame.json --plan e2e/aratame/plan.json --approve SHA256
   aratame review --project . --plan e2e/aratame/plan.json --repair-review e2e/aratame/local-FAILED_RUN.json
   aratame run --project . --config aratame.json --plan e2e/aratame/plan.json --approve PLAN_SHA256 --repair-review e2e/aratame/local-FAILED_RUN.json --approve-repair REPAIR_SHA256
+  aratame plan --project . --config aratame.json --repository OWNER/REPO --commit FULL_SHA [--manifest aratame/knowledge/manifest.json] [--knowledge ID ...] [--case ID ...]
 
 plan sends specified requirement/context files directly to your configured BYOK provider
 (OpenAI, Anthropic, OpenRouter), validates the draft/critique/merge, and writes a draft.
+An explicit published revision reads a prepared local Git checkout, without fetching
+or switching branches. With no --requirements, plan imports existing definitions
+without a model; publication never approves execution. KB-only planning uses explicit
+--requirements plus selected --knowledge evidence. Plans bind the exact revision,
+and review/run reject changed checkout inputs before fixtures and certification.
 review displays the complete validated plan and its SHA256. Inspect its cases, gaps,
 target and linked specs, plus your config/fixture. run requires that exact digest.
 All listed cases execute. Linked failures retain their original evidence. Optional
@@ -147,6 +154,11 @@ async function main() {
       approve: { type: "string" },
       "repair-review": { type: "string" },
       "approve-repair": { type: "string" },
+      manifest: { type: "string" },
+      commit: { type: "string" },
+      repository: { type: "string" },
+      knowledge: { type: "string", multiple: true },
+      case: { type: "string", multiple: true },
     },
   });
   if (values.help || !positionals.length) {
@@ -220,6 +232,9 @@ async function main() {
     typeof config.project !== "string"
   )
     throw new Error("Invalid runner config; enroll first");
+  const relativeConfig = path.relative(path.resolve(config.project), filename);
+  if (relativeConfig && !relativeConfig.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeConfig))
+    config.localConfigPath = relativeConfig.split(path.sep).join("/");
   if (
     config.testTimeoutMs !== undefined &&
     (!Number.isInteger(config.testTimeoutMs) ||
@@ -288,6 +303,8 @@ async function main() {
         } catch (error) {
           report = {
             ...error.partialReport,
+            ...((job.publishedRevision || job.run.publishedRevision) ? { publishedRevision: job.publishedRevision || job.run.publishedRevision } : {}),
+            ...((job.candidateRevision || job.run.candidateRevision) ? { candidateRevision: job.candidateRevision || job.run.candidateRevision } : {}),
             status: "blocked",
             error: error.message,
             logs: error.message,

@@ -29,6 +29,8 @@
     "model.mjs",
     "repair.mjs",
     "standalone.mjs",
+    "published-artifacts.mjs",
+    "published-artifacts.d.mts",
     "README.md",
     "LICENSE",
     "NOTICE",
