@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { artifactManifestSchema, readPublishedArtifacts, resolvePublishedOriginal } from "./published-artifacts.mjs";
+import { artifactManifestSchema, assembleKnowledgeContext, readPublishedArtifacts, resolvePublishedOriginal, validateArtifactWikiContent } from "./published-artifacts.mjs";
 import { executeJob } from "./execution.mjs";
 import { standalone } from "./standalone.mjs";
 
@@ -79,6 +79,273 @@ test('empty inbox', async () => {
   const job = { run: { id: "published-run", publishedRevision: revision }, publishedRevision: revision, supportingFiles, cases, reviews: [], plan: { publishedRevision: revision, requirements: "Empty inbox" } };
   return { project, marker, revision, manifest, job, git, put };
 }
+
+async function wikiFixture(t, { mutate = () => {}, mixed = true } = {}) {
+  const f = await fixture(t, { mixed });
+  const legacyRevision = f.revision;
+  const rows = [
+    ["inbox-overview", "inbox", "overview", ["inbox::send", "inbox::read"], "inbox.md"],
+    ["inbox-send", "inbox", "capability", ["general::policy", "archive::export"], "send.md"],
+    ["inbox-read", "inbox", "capability", [], "read.md"],
+    ["general-overview", "general", "overview", ["general::policy"], "general.md"],
+    ["general-policy", "general", "shared", ["inbox::send"], "policy.md"],
+    ["archive-overview", "archive", "overview", ["archive::export"], "archive.md"],
+    ["archive-export", "archive", "capability", [], "export.md"],
+  ];
+  const knowledge = rows.map(([id, surface, role, links, filename]) => ({
+    ...f.manifest.knowledge[0], id, title: id, surface, path: `aratame/knowledge/pages/${filename}`,
+    wiki: { publicationId: `publication-${surface}`, pageKey: `${surface}::${role === "overview" ? "overview" : id.slice(surface.length + 1)}`, role, links },
+    history: [],
+  }));
+  const contents = {};
+  for (const page of knowledge) {
+    contents[page.path] = `# ${page.title}\n${page.id === "general-policy" ? "Exports require an explicit consent decision; missing approval is unknown." : "Documented workflow."} [ISSUE-1]\n` +
+      page.wiki.links.map((key) => `[${key}](${path.posix.basename(knowledge.find((entry) => entry.wiki.pageKey === key).path)})`).join("\n") + "\n";
+  }
+  const historyPath = "aratame/knowledge/history/inbox-v2.md";
+  contents[historyPath] = "# Inbox\nEmpty accounts show No messages. [ISSUE-1]\n";
+  knowledge[0].history = [{ id: "inbox-guide", path: historyPath, updatedAt: "2026-09-11T00:00:00Z" }];
+  const indexPath = "aratame/knowledge/INDEX.md";
+  contents[indexPath] = "# Knowledge index\n" + knowledge.map((page) => `[${page.title}](pages/${path.posix.basename(page.path)})`).join("\n") + "\n";
+  const manifest = {
+    ...f.manifest, schemaVersion: 3, knowledge,
+    publications: ["inbox", "general", "archive"].map((surface) => ({ id: `publication-${surface}`, surface, overviewId: `${surface}-overview`, pageIds: knowledge.filter((page) => page.surface === surface).map((page) => page.id) })),
+    conventions: { version: 1, path: "aratame/knowledge/CONVENTIONS.md" }, indexPath,
+  };
+  mutate(manifest, contents);
+  manifest.files = [...manifest.files.filter((file) => file.kind !== "knowledge"), ...Object.entries(contents).map(([filename, content]) => ({
+    path: filename, sha256: digest(content), origin: "generated", kind: filename === indexPath ? "conventions" : "knowledge",
+  }))];
+  for (const [filename, content] of Object.entries(contents)) await f.put(filename, content);
+  const raw = JSON.stringify(manifest, null, 2) + "\n";
+  await f.put(f.revision.manifestPath, raw);
+  await f.git("add", "aratame");
+  await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "Controlled coherent wiki");
+  const revision = { ...f.revision, commitSha: await f.git("rev-parse", "HEAD"), manifestSha256: digest(raw) };
+  return { ...f, manifest, revision, legacyRevision };
+}
+
+test("v3 narrow context retains overview, shared and cross-surface constraints without unrelated siblings", async (t) => {
+  const f = await wikiFixture(t);
+  const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+  const context = assembleKnowledgeContext(artifacts.knowledge, { knowledgeIds: ["inbox-send"], maxStageBytes: 400 });
+  assert.deepEqual(context.knowledge.map((page) => page.id), ["inbox-overview", "general-overview", "archive-overview", "inbox-send", "general-policy", "archive-export"]);
+  assert.deepEqual(context.omitted.map((page) => page.id), ["inbox-read"]);
+  assert.match(context.knowledge.find((page) => page.id === "general-policy").content, /missing approval is unknown/);
+  assert.deepEqual(context.stages.flatMap((stage) => stage.pageIds), context.knowledge.map((page) => page.id));
+  for (const stage of context.stages) {
+    assert.equal(stage.bytes, context.knowledge.filter((page) => stage.pageIds.includes(page.id)).reduce((total, page) => total + Buffer.byteLength(page.content), 0));
+    assert.ok(stage.bytes <= 400);
+  }
+  assert.deepEqual(assembleKnowledgeContext(artifacts.knowledge, { surface: "inbox" }).omitted, []);
+  assert.deepEqual(assembleKnowledgeContext(artifacts.knowledge).omitted, []);
+  assert.throws(() => assembleKnowledgeContext(artifacts.knowledge, { knowledgeIds: ["missing"] }), /selection/);
+  assert.throws(() => assembleKnowledgeContext(artifacts.knowledge, { maxStageBytes: 1 }), /whole-page stage budget/);
+  assert.equal(resolvePublishedOriginal(artifacts, "ISSUE-1").status, "unavailable");
+});
+
+test("v3 rejects incomplete publications, unbound original revisions and broken navigation", async (t) => {
+  const scenarios = [
+    ["missing member", (manifest) => { manifest.publications[0].pageIds.pop(); }, /membership/],
+    ["missing map entry", (manifest) => { manifest.knowledge[0].wiki.links.pop(); }, /map entry/],
+    ["wrong original revision", (manifest) => { manifest.knowledge[1].sourceVersions["ISSUE-1"] = "different"; }, /Original revision/],
+    ["broken dependency link", (_, contents) => { contents["aratame/knowledge/pages/send.md"] = "# Send\n[Policy](missing.md) [ISSUE-1]\n"; }, /Broken wiki link/],
+    ["missing index entry", (manifest, contents) => { contents[manifest.indexPath] = "# Index\n[Inbox](pages/inbox.md)\n"; }, /index omits/],
+    ["undeclared dependency", (_, contents) => { contents["aratame/knowledge/pages/read.md"] += "[Export](export.md)\n"; }, /Undeclared wiki dependency/],
+    ["unknown inline original", (_, contents) => { contents["aratame/knowledge/pages/read.md"] += "[NOT-SUPPLIED]\n"; }, /Unknown original citation/],
+    ["bad anchor", (_, contents) => { contents["aratame/knowledge/pages/read.md"] += "[Heading](#absent)\n"; }, /Broken wiki anchor/],
+    ["unsafe encoded link", (_, contents) => { contents["aratame/knowledge/pages/read.md"] += "[Unsafe](%2Fetc%2Fpasswd)\n"; }, /Unsafe wiki link/],
+    ["unresolved reference", (_, contents) => { contents["aratame/knowledge/pages/read.md"] += "[Missing][no-target]\n"; }, /Unresolved Markdown reference/],
+    ["malformed link", (_, contents) => { contents["aratame/knowledge/pages/read.md"] += "[Missing](read.md\n"; }, /Malformed Markdown link/],
+    ["reference first target stays authoritative", (_, contents) => { contents["aratame/knowledge/pages/send.md"] = "# Send\n[Policy][p] and [Export](export.md). [ISSUE-1]\n\n[p]: missing.md\n[P]: policy.md\n"; }, /Broken wiki link/],
+  ];
+  for (const [name, mutate, expected] of scenarios) await t.test(name, async (t) => {
+    const f = await wikiFixture(t, { mutate });
+    await assert.rejects(readPublishedArtifacts({ projectDir: f.project, revision: f.revision }), expected);
+  });
+});
+
+test("v3 supports portable reference navigation and keeps v2 history readable at its original pin", async (t) => {
+  const f = await wikiFixture(t, { mutate: (_, contents) => {
+    contents["aratame/knowledge/pages/send.md"] = "# Send\n[Policy][policy] and [Export](export.md#archive-export). [ISSUE-1]\n\n[policy]: policy.md\n[POLICY]: missing.md\n";
+  } });
+  const current = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+  assert.equal(current.knowledge[0].history[0].id, "inbox-guide");
+  assert.equal(current.files.find((file) => file.path.endsWith("history/inbox-v2.md")).content, "# Inbox\nEmpty accounts show No messages. [ISSUE-1]\n");
+  await f.git("checkout", "--detach", f.legacyRevision.commitSha);
+  const previous = await readPublishedArtifacts({ projectDir: f.project, revision: f.legacyRevision });
+  assert.equal(previous.manifest.schemaVersion, 2);
+  assert.deepEqual(previous.knowledge.map((page) => page.id), ["inbox-guide"]);
+  assert.equal(previous.knowledge[0].wiki, undefined);
+  assert.deepEqual(previous.knowledge[0].citations, ["ISSUE-1"]);
+});
+
+test("v3 CLI imports dependency closure and binds its review receipt without granting execution approval", async (t) => {
+  const f = await wikiFixture(t);
+  const invoke = (...args) => exec(process.execPath, [cli, ...args], { cwd: f.project, timeout: 60_000 });
+  await invoke("plan", "--project", f.project, "--config", "config.json", "--repository", f.revision.repository, "--commit", f.revision.commitSha, "--knowledge", "inbox-send", "--case", "inbox");
+  const raw = await fs.readFile(path.join(f.project, "e2e/aratame/plan.json"), "utf8");
+  const plan = JSON.parse(raw);
+  assert.deepEqual(plan.contextSelection.omitted.map((page) => page.id), ["inbox-read"]);
+  assert.ok(plan.sources.some((source) => source.path.endsWith("/policy.md")));
+  assert.ok(plan.sources.some((source) => source.path.endsWith("/export.md")));
+  assert.deepEqual(plan.cases, f.manifest.cases);
+  assert.deepEqual(plan.publishedRevision, f.revision);
+  const review = await invoke("review", "--project", f.project, "--plan", "e2e/aratame/plan.json", "--knowledge", "inbox-send", "--surface", "inbox");
+  assert.ok(review.stdout.includes(digest(raw)));
+  await assert.rejects(invoke("run", "--project", f.project, "--config", "config.json", "--plan", "e2e/aratame/plan.json", "--knowledge", "inbox-send", "--surface", "inbox"), /requires --approve/);
+  await assert.rejects(fs.access(f.marker), { code: "ENOENT" });
+  const policyId = "general-policy";
+  const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision, localFiles: [{ path: "e2e/aratame/plan.json", sha256: digest(raw) }] });
+  const policy = artifacts.knowledge.find((page) => page.id === policyId);
+  const stage = plan.contextSelection.stages.find((stage) => stage.pageIds.includes(policyId));
+  stage.pageIds = stage.pageIds.filter((id) => id !== policyId);
+  stage.bytes -= Buffer.byteLength(policy.content);
+  plan.contextSelection.omitted.push({ id: policyId, reason: "Manually omitted" });
+  plan.sources = plan.sources.filter((source) => source.path !== policy.path);
+  await f.put("e2e/aratame/plan.json", JSON.stringify(plan));
+  await assert.rejects(invoke("review", "--project", f.project, "--plan", "e2e/aratame/plan.json"), /required dependency/);
+});
+
+test("staged standalone reading preserves a shared constraint finding even when later model output drops it", async (t) => {
+  const f = await wikiFixture(t, { mixed: false, mutate: (_, contents) => {
+    for (const filename of Object.keys(contents)) if (filename.includes("/pages/")) contents[filename] += "Documented context. ".repeat(2800);
+  } });
+  const key = "ARATAME_WIKI_STAGE_TEST_KEY";
+  const previous = process.env[key];
+  process.env[key] = "controlled-wiki-stage-key";
+  t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
+  await f.put("config.json", JSON.stringify({ baseUrl: "http://127.0.0.1:3000", model: { provider: "openai", model: "controlled", apiKeyEnv: key } }));
+  await f.put("requirements.txt", "Plan inbox sending and its consent/export interactions.");
+  await f.git("add", "config.json", "requirements.txt");
+  await f.git("-c", "commit.gpgsign=false", "commit", "-qm", "Controlled staged planning inputs");
+  const finding = "Export consent: missing explicit approval remains unknown.";
+  const seen = new Map();
+  t.mock.method(globalThis, "fetch", async (_, options) => {
+    const request = JSON.parse(options.body);
+    const input = JSON.parse(request.messages.find((message) => message.role === "user").content);
+    for (const page of input.evidence) if (page.id) seen.set(page.id, page.content);
+    const behavior = { title: "Review export consent", surface: "inbox", category: "functional", priority: "P1", preconditions: "An operator-supplied consent decision.", steps: ["Send an export request"], expected: "The documented consent requirement governs export." };
+    const response = input.draft && !input.critique
+      ? { critique: "Controlled review of this stage.", gaps: [] }
+      : { title: "Staged inbox plan", cases: [behavior], gaps: !input.draft && input.evidence.some((page) => page.id === "general-policy") ? [finding] : [], rationale: "Controlled staged coverage." };
+    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(response) } }] }), { headers: { "content-type": "application/json" } });
+  });
+  t.mock.method(console, "log", () => {});
+  await standalone("plan", { project: f.project, config: "config.json", requirements: "requirements.txt", repository: f.revision.repository, commit: await f.git("rev-parse", "HEAD"), knowledge: ["inbox-send"] });
+  const plan = JSON.parse(await fs.readFile(path.join(f.project, "e2e/aratame/plan.json"), "utf8"));
+  assert.deepEqual(plan.gaps, [finding]);
+  assert.deepEqual([...seen.keys()], plan.contextSelection.stages.flatMap((stage) => stage.pageIds));
+  assert.deepEqual(plan.contextSelection.omitted.map((page) => page.id), ["inbox-read"]);
+  assert.match(seen.get("general-policy"), /missing approval is unknown/);
+  for (const [id, content] of seen) assert.equal(content, await fs.readFile(path.join(f.project, f.manifest.knowledge.find((page) => page.id === id).path), "utf8"));
+  assert.ok(plan.contextSelection.stages.length > 1);
+});
+
+test("pre-review wiki validation rejects unpinned navigation without changing immutable legacy readers", async (t) => {
+  const f = await wikiFixture(t);
+  const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+  const files = artifacts.files.map((file) => file.path.endsWith("/read.md") ? { ...file, content: "# Read\n[Unreviewed](unreviewed.md)\n" } : file);
+  files.push({ path: "aratame/knowledge/pages/unreviewed.md", content: "# Unreviewed\n" });
+  assert.throws(() => validateArtifactWikiContent(artifacts.manifest, files), /Broken wiki link/);
+  for (const schemaVersion of [1, 2]) await t.test(`historic v${schemaVersion}`, async (t) => {
+    const previous = await fixture(t, { schemaVersion });
+    const filename = previous.manifest.knowledge[0].path;
+    const content = "# Historical guide\n[Old navigation](no-longer-available.md)\n";
+    previous.manifest.files.find((file) => file.path === filename).sha256 = digest(content);
+    await previous.put(filename, content);
+    const raw = JSON.stringify(previous.manifest);
+    await previous.put(previous.revision.manifestPath, raw);
+    await previous.git("add", "aratame");
+    await previous.git("-c", "commit.gpgsign=false", "commit", "-qm", "Controlled legacy navigation");
+    const revision = { ...previous.revision, commitSha: await previous.git("rev-parse", "HEAD"), manifestSha256: digest(raw) };
+    const read = await readPublishedArtifacts({ projectDir: previous.project, revision });
+    assert.equal(read.knowledge[0].content, content);
+    assert.equal(read.manifest.schemaVersion, schemaVersion);
+  });
+});
+
+test("v3 candidate execution preserves v2 accepted lineage and rejects a different checkout before fixtures", async (t) => {
+  const f = await wikiFixture(t);
+  const job = { ...f.job, candidateRevision: f.revision, run: { ...f.job.run, id: "wiki-candidate", candidateRevision: f.revision } };
+  const config = { project: f.project, fixture: [process.execPath, "fixtures/reset.mjs", f.marker] };
+  await f.git("checkout", "--detach", f.legacyRevision.commitSha);
+  await assert.rejects(executeJob(config, job, async () => ({}), AbortSignal.timeout(60_000)), /commit differs/);
+  await assert.rejects(fs.access(f.marker), { code: "ENOENT" });
+  await f.git("checkout", "--detach", f.revision.commitSha);
+  const report = await executeJob(config, job, async () => ({}), AbortSignal.timeout(60_000));
+  assert.equal(report.status, "passed");
+  assert.deepEqual(report.publishedRevision, f.legacyRevision);
+  assert.deepEqual(report.candidateRevision, f.revision);
+  assert.deepEqual(report.localReceipt.publishedRevision, f.legacyRevision);
+  assert.deepEqual(report.localReceipt.candidateRevision, f.revision);
+});
+
+test("implicit overviews retain cross-surface dependencies while excluding their unrelated capability map", () => {
+  const pages = [
+    { id: "overview", surface: "billing", content: "Billing map", wiki: { publicationId: "billing", pageKey: "billing::overview", role: "overview", links: ["billing::pay", "billing::history", "general::consent"] } },
+    { id: "pay", surface: "billing", content: "Pay", wiki: { publicationId: "billing", pageKey: "billing::pay", role: "capability", links: [] } },
+    { id: "history", surface: "billing", content: "History", wiki: { publicationId: "billing", pageKey: "billing::history", role: "capability", links: [] } },
+    { id: "consent", surface: "general", content: "Explicit consent required.", wiki: { publicationId: "authored-consent", pageKey: "general::consent", role: "shared", links: [] } },
+  ];
+  const context = assembleKnowledgeContext(pages, { knowledgeIds: ["pay"] });
+  assert.deepEqual(context.knowledge.map((page) => page.id), ["overview", "pay", "consent"]);
+  assert.deepEqual(context.omitted.map((page) => page.id), ["history"]);
+  assert.throws(() => assembleKnowledgeContext([{ id: "utf8", surface: "general", content: "é" }], { maxStageBytes: 1 }), /whole-page stage budget/);
+});
+
+test("wiki links to authored constraints require representable dependency metadata", async (t) => {
+  const f = await wikiFixture(t);
+  const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+  const manifest = structuredClone(artifacts.manifest);
+  const authored = { ...manifest.knowledge[2], id: "authored-policy", title: "Authored policy", surface: "billing", path: "aratame/knowledge/pages/authored-policy.md", origin: "authored" };
+  delete authored.wiki;
+  manifest.knowledge.push(authored);
+  const content = "# Authored policy\nConsent remains operator-owned. [ISSUE-1]\n";
+  const file = { path: authored.path, kind: "knowledge", origin: "authored", sha256: digest(content) };
+  manifest.files.push(file);
+  const files = [...artifacts.files.map((file) => {
+    if (file.path === manifest.indexPath) return { ...file, content: file.content + "[Authored policy](pages/authored-policy.md)\n" };
+    if (file.path.endsWith("/read.md")) return { ...file, content: file.content + "[Authored policy](authored-policy.md)\n" };
+    return file;
+  }), { ...file, content }];
+  assert.throws(() => validateArtifactWikiContent(manifest, files), /lacks dependency metadata/);
+  authored.wiki = { publicationId: "authored-policy", pageKey: "authored::policy", role: "shared", links: [] };
+  manifest.knowledge.find((page) => page.id === "inbox-read").wiki.links.push(authored.wiki.pageKey);
+  validateArtifactWikiContent(manifest, files);
+  const context = assembleKnowledgeContext(manifest.knowledge.map((page) => ({ ...page, content: files.find((file) => file.path === page.path).content })), { knowledgeIds: ["inbox-read"] });
+  assert.ok(context.knowledge.some((page) => page.id === authored.id && page.content === content));
+  assert.ok(!context.omitted.some((page) => page.id === authored.id));
+});
+
+test("withdrawn evidence is a sole overview notice, never a citation-bearing current publication", async (t) => {
+  const f = await wikiFixture(t, { mixed: false, mutate: (manifest, contents) => {
+    const overview = manifest.knowledge[0];
+    overview.citations = [];
+    overview.sourceVersions = {};
+    overview.wiki = { ...overview.wiki, links: [], evidenceStatus: "withdrawn" };
+    manifest.knowledge = [overview];
+    manifest.publications = [{ ...manifest.publications[0], pageIds: [overview.id] }];
+    contents[overview.path] = "# Inbox\nOriginal evidence was withdrawn. Prior publications remain historical; no current facts are asserted.\n";
+  } });
+  const artifacts = await readPublishedArtifacts({ projectDir: f.project, revision: f.revision });
+  const overview = artifacts.knowledge[0];
+  assert.equal(overview.wiki.evidenceStatus, "withdrawn");
+  assert.deepEqual(overview.sourceVersions, {});
+  assert.deepEqual(assembleKnowledgeContext(artifacts.knowledge, { surface: "inbox" }).knowledge.map((page) => page.id), [overview.id]);
+  for (const mutate of [
+    (manifest) => { manifest.knowledge[0].citations = ["ISSUE-1"]; },
+    (manifest) => { manifest.knowledge[0].sourceVersions = { "ISSUE-1": manifest.sources[0].updatedAt }; },
+    (manifest) => { manifest.knowledge[0].wiki.links = [manifest.knowledge[0].wiki.pageKey]; },
+    (manifest) => { manifest.knowledge[0].wiki.role = "capability"; },
+    (manifest) => { manifest.publications[0].pageIds.push(manifest.knowledge[0].id); },
+    (manifest) => { manifest.knowledge[0].evidenceStatus = "withdrawn"; },
+  ]) {
+    const manifest = structuredClone(artifacts.manifest);
+    mutate(manifest);
+    assert.equal(artifactManifestSchema.safeParse(manifest).success, false);
+  }
+});
 
 test("KB-only published files retain source references and remain credential-free readable", async (t) => {
   const f = await fixture(t);
@@ -315,7 +582,7 @@ test("oversized published planning page is rejected before any model request", a
   });
   let calls = 0;
   t.mock.method(globalThis, "fetch", async () => { calls++; throw new Error("A model must not be called"); });
-  await assert.rejects(standalone("plan", { project: f.project, config: "config.json", requirements: "requirements.txt", repository: f.revision.repository, commit: await f.git("rev-parse", "HEAD") }), /100 KB per-page/);
+  await assert.rejects(standalone("plan", { project: f.project, config: "config.json", requirements: "requirements.txt", repository: f.revision.repository, commit: await f.git("rev-parse", "HEAD") }), /whole-page stage budget/);
   assert.equal(calls, 0);
   await assert.rejects(fs.access(path.join(f.project, "e2e/aratame/plan.json")), { code: "ENOENT" });
 });

@@ -15,6 +15,7 @@ const capabilities = [
   "linked-repair-v1",
   "published-artifacts-v1",
   "published-artifacts-v2",
+  "published-artifacts-v3",
 ];
 
 const help = `Aratame QA toolkit — local-first, no Aratame account required
@@ -25,7 +26,7 @@ Standalone (file paths are relative to --project):
   aratame run --project . --config aratame.json --plan e2e/aratame/plan.json --approve SHA256
   aratame review --project . --plan e2e/aratame/plan.json --repair-review e2e/aratame/local-FAILED_RUN.json
   aratame run --project . --config aratame.json --plan e2e/aratame/plan.json --approve PLAN_SHA256 --repair-review e2e/aratame/local-FAILED_RUN.json --approve-repair REPAIR_SHA256
-  aratame plan --project . --config aratame.json --repository OWNER/REPO --commit FULL_SHA [--manifest aratame/knowledge/manifest.json] [--knowledge ID ...] [--case ID ...]
+  aratame plan --project . --config aratame.json --repository OWNER/REPO --commit FULL_SHA [--manifest aratame/knowledge/manifest.json] [--surface NAME] [--knowledge ID ...] [--case ID ...]
 
 plan sends specified requirement/context files directly to your configured BYOK provider
 (OpenAI, Anthropic, OpenRouter), validates the draft/critique/merge, and writes a draft.
@@ -34,6 +35,8 @@ or switching branches. With no --requirements, plan imports existing definitions
 without a model; publication never approves execution. KB-only planning uses explicit
 --requirements plus selected --knowledge evidence. Plans bind the exact revision,
 and review/run reject changed checkout inputs before fixtures and certification.
+--knowledge expands required overview/shared dependencies; --surface selects its full
+capability map. Omit both for the full map. Plans record stages and unrelated omissions.
 review displays the complete validated plan and its SHA256. Inspect its cases, gaps,
 target and linked specs, plus your config/fixture. run requires that exact digest.
 All listed cases execute. Linked failures retain their original evidence. Optional
@@ -159,6 +162,7 @@ async function main() {
       commit: { type: "string" },
       repository: { type: "string" },
       knowledge: { type: "string", multiple: true },
+      surface: { type: "string" },
       case: { type: "string", multiple: true },
     },
   });

@@ -33,6 +33,18 @@ const knowledgeSchema = z.object({
   sourceVersions: z.record(identity, text).refine((value) => Object.keys(value).length <= 1000),
   gaps: z.array(text).max(100), history: z.array(historySchema).max(200),
 }).strict();
+export const wikiPageMetadataSchema = z.object({
+  publicationId: identity,
+  pageKey: identity.refine((value) => !/[\u0000-\u001f\u007f/\\]/.test(value), "Unsafe wiki page key"),
+  role: z.enum(["overview", "capability", "shared"]),
+  links: z.array(identity).max(200).refine((links) => new Set(links).size === links.length, "Duplicate wiki dependency"),
+  evidenceStatus: z.literal("withdrawn").optional(),
+}).strict().refine((wiki) => wiki.evidenceStatus !== "withdrawn" || (wiki.role === "overview" && wiki.links.length === 0), "Withdrawn evidence requires an overview without dependencies");
+const wikiKnowledgeSchema = knowledgeSchema.extend({ wiki: wikiPageMetadataSchema.optional() });
+const publicationSchema = z.object({
+  id: identity, surface: z.string().min(1).max(120), overviewId: identity,
+  pageIds: z.array(identity).min(1).max(200),
+}).strict();
 const sourceSchema = z.object({
   id: identity, title: z.string().min(1).max(500), source: text,
   sourceUrl: z.string().url().max(2000).refine((value) => {
@@ -67,9 +79,17 @@ const manifestShape = {
   knowledge: z.array(knowledgeSchema).max(200), cases: z.array(caseSchema).max(200),
 };
 export const artifactManifestSchema = z.discriminatedUnion("schemaVersion", [
-  // Immutable historical commits remain readable; producers use version 2.
+  // Historical versions keep their original validation rules.
   z.object({ ...manifestShape, schemaVersion: z.literal(1), files: z.array(fileSchema).max(500), sources: z.array(sourceSchema).max(1000) }).strict(),
   z.object({ ...manifestShape, schemaVersion: z.literal(2), files: z.array(sourceFileSchema).max(500), sources: z.array(portableSourceSchema).max(1000) }).strict(),
+  z.object({
+    ...manifestShape, schemaVersion: z.literal(3),
+    knowledge: z.array(wikiKnowledgeSchema).max(200),
+    files: z.array(sourceFileSchema).max(500), sources: z.array(portableSourceSchema).max(1000),
+    publications: z.array(publicationSchema).max(200),
+    conventions: z.object({ version: z.literal(1), path: artifactPathSchema }).strict(),
+    indexPath: artifactPathSchema,
+  }).strict(),
 ]).superRefine((manifest, ctx) => {
   const issue = (message) => ctx.addIssue({ code: "custom", message });
   for (const [items, key] of [[manifest.files, "path"], [manifest.knowledge, "id"], [manifest.sources, "id"], [manifest.cases, "id"]]) {
@@ -82,14 +102,14 @@ export const artifactManifestSchema = z.discriminatedUnion("schemaVersion", [
     for (const previous of page.history) {
       if (files.get(previous.path)?.kind !== "knowledge") issue(`History file missing: ${previous.path}`);
     }
-    if (manifest.schemaVersion === 2) {
+    if (manifest.schemaVersion >= 2) {
       for (const id of page.citations) if (!Object.hasOwn(page.sourceVersions, id)) issue(`Citation lacks original revision: ${id}`);
       for (const [id, version] of Object.entries(page.sourceVersions)) {
         if (!manifest.sources.some((source) => source.id === id && source.updatedAt === version)) issue(`Original revision missing: ${id}`);
       }
     }
   }
-  if (manifest.schemaVersion === 2) {
+  if (manifest.schemaVersion >= 2) {
     const snapshots = new Set();
     for (const source of manifest.sources) if (source.retention === "repository") {
       const file = files.get(source.path);
@@ -98,6 +118,56 @@ export const artifactManifestSchema = z.discriminatedUnion("schemaVersion", [
       snapshots.add(source.path);
     }
     for (const file of manifest.files) if (file.kind === "source-snapshot" && !snapshots.has(file.path)) issue(`Source snapshot lacks provenance: ${file.path}`);
+  }
+  if (manifest.schemaVersion === 3) {
+    const pages = new Map(manifest.knowledge.map((page) => [page.id, page]));
+    const keys = new Map();
+    const paths = new Set();
+    const memberships = new Set();
+    const publicationIds = new Set();
+    const surfaces = new Set();
+    for (const page of manifest.knowledge) {
+      if (paths.has(page.path)) issue(`Duplicate knowledge path: ${page.path}`);
+      paths.add(page.path);
+      if (page.origin === "generated" && !page.wiki) issue(`Generated page lacks wiki metadata: ${page.id}`);
+      if (page.wiki) {
+        if (keys.has(page.wiki.pageKey)) issue(`Duplicate wiki page key: ${page.wiki.pageKey}`);
+        keys.set(page.wiki.pageKey, page);
+        if (page.wiki.role === "overview" && page.wiki.pageKey !== `${page.surface}::overview`) issue(`Overview key differs from surface: ${page.id}`);
+        if (page.origin === "generated" && (!page.wiki.pageKey.startsWith(`${page.surface}::`) || page.wiki.pageKey.length === page.surface.length + 2)) issue(`Generated page key differs from surface: ${page.id}`);
+        if (page.origin === "authored" && page.wiki.role !== "shared") issue(`Authored wiki metadata must use shared role: ${page.id}`);
+        if (page.wiki.evidenceStatus === "withdrawn" && (page.citations.length !== 0 || Object.keys(page.sourceVersions).length !== 0)) issue(`Withdrawn overview cannot cite current evidence: ${page.id}`);
+      }
+    }
+    for (const publication of manifest.publications) {
+      if (publicationIds.has(publication.id) || surfaces.has(publication.surface)) issue(`Duplicate publication identity or surface: ${publication.id}`);
+      publicationIds.add(publication.id);
+      surfaces.add(publication.surface);
+      const overview = pages.get(publication.overviewId);
+      if (!publication.pageIds.includes(publication.overviewId) || overview?.wiki?.role !== "overview") issue(`Publication overview missing: ${publication.id}`);
+      if (overview?.wiki?.evidenceStatus === "withdrawn" && publication.pageIds.length !== 1) issue(`Withdrawn overview must be the sole publication member: ${publication.id}`);
+      let overviews = 0;
+      for (const id of publication.pageIds) {
+        const page = pages.get(id);
+        if (memberships.has(id)) issue(`Page belongs to multiple publication entries: ${id}`);
+        memberships.add(id);
+        if (!page || page.origin !== "generated" || page.surface !== publication.surface || page.wiki?.publicationId !== publication.id) {
+          issue(`Publication page missing or mismatched: ${id}`);
+          continue;
+        }
+        if (page.wiki.role === "overview") overviews++;
+        else if (!overview?.wiki?.links.includes(page.wiki.pageKey)) issue(`Overview omits capability map entry: ${id}`);
+        if (page.surface === "general" && page.wiki.role === "capability") issue(`General detail must be shared: ${id}`);
+      }
+      if (overviews !== 1) issue(`Publication requires exactly one overview: ${publication.id}`);
+    }
+    for (const page of manifest.knowledge) {
+      if (page.origin === "generated" && !memberships.has(page.id)) issue(`Generated page lacks publication membership: ${page.id}`);
+      for (const key of page.wiki?.links ?? []) if (!keys.has(key)) issue(`Wiki dependency missing: ${key}`);
+    }
+    if (files.get(manifest.conventions.path)?.kind !== "conventions") issue("Versioned conventions file missing");
+    if (!["conventions", "provenance"].includes(files.get(manifest.indexPath)?.kind)) issue("Wiki index file missing");
+    if (manifest.indexPath === manifest.conventions.path) issue("Index and conventions must be separate files");
   }
   for (const item of manifest.cases) {
     if (!item.specPath && (item.specTag || item.sha256)) issue(`Script metadata requires specPath: ${item.id}`);
@@ -108,6 +178,191 @@ export const artifactManifestSchema = z.discriminatedUnion("schemaVersion", [
     }
   }
 });
+
+/** Pure structural selection. Implicit overviews orient a narrow scope without expanding their map. */
+export function assembleKnowledgeContext(pages, options = {}) {
+  const maxStageBytes = options.maxStageBytes ?? 100_000;
+  if (!Number.isSafeInteger(maxStageBytes) || maxStageBytes < 1) throw new Error("maxStageBytes must be a positive safe integer");
+  const byId = new Map();
+  const byKey = new Map();
+  const overviews = new Map();
+  for (const page of pages) {
+    if (byId.has(page.id)) throw new Error(`Duplicate knowledge ID: ${page.id}`);
+    byId.set(page.id, page);
+    if (page.wiki) {
+      wikiPageMetadataSchema.parse(page.wiki);
+      if (byKey.has(page.wiki.pageKey)) throw new Error(`Duplicate wiki page key: ${page.wiki.pageKey}`);
+      byKey.set(page.wiki.pageKey, page);
+      if (page.wiki.role === "overview") {
+        if (overviews.has(page.surface)) throw new Error(`Duplicate surface overview: ${page.surface}`);
+        overviews.set(page.surface, page);
+      }
+    }
+  }
+  if (options.surface !== undefined && !pages.some((page) => page.surface === options.surface)) throw new Error(`Unknown knowledge surface: ${options.surface}`);
+  const ids = options.knowledgeIds;
+  if (ids && (new Set(ids).size !== ids.length || ids.some((id) => !byId.has(id)))) throw new Error("Unknown or duplicate published knowledge selection");
+  if (ids?.length && options.surface !== undefined && ids.some((id) => byId.get(id).surface !== options.surface)) throw new Error("Knowledge selection differs from requested surface");
+  const roots = ids?.length ? ids.map((id) => byId.get(id)) : options.surface !== undefined ? pages.filter((page) => page.surface === options.surface) : pages;
+  const selected = new Set();
+  const traversed = new Set();
+  const oriented = new Set();
+  const orient = (page) => {
+    if (!page.wiki) return;
+    const overview = overviews.get(page.surface);
+    if (!overview && page.wiki.role !== "shared") throw new Error(`Surface overview missing: ${page.surface}`);
+    if (!overview || oriented.has(overview.id)) return;
+    oriented.add(overview.id);
+    selected.add(overview.id);
+    for (const key of overview.wiki.links) {
+      const target = byKey.get(key);
+      if (!target) throw new Error(`Required wiki dependency missing: ${key}`);
+      if (target.surface !== overview.surface) visit(target);
+    }
+  };
+  const visit = (page) => {
+    selected.add(page.id);
+    orient(page);
+    if (traversed.has(page.id)) return;
+    traversed.add(page.id);
+    for (const key of page.wiki?.links ?? []) {
+      const target = byKey.get(key);
+      if (!target) throw new Error(`Required wiki dependency missing: ${key}`);
+      // A detail's backlink to its own map is orientation, not a request for every sibling.
+      if (target.wiki.role === "overview" && target.surface === page.surface && page.wiki.role !== "overview") {
+        selected.add(target.id);
+      } else visit(target);
+    }
+  };
+  if (roots.length) {
+    const general = overviews.get("general");
+    if (general) orient(general);
+    for (const page of pages) if (page.surface === "general" && !page.wiki) visit(page);
+  }
+  for (const page of roots) visit(page);
+  const knowledge = [...pages.filter((page) => selected.has(page.id) && page.wiki?.role === "overview"), ...pages.filter((page) => selected.has(page.id) && page.wiki?.role !== "overview")];
+  const stages = [];
+  for (const page of knowledge) {
+    const bytes = Buffer.byteLength(page.content ?? "", "utf8");
+    if (bytes > maxStageBytes) throw new Error(`Knowledge page ${page.id} exceeds the ${maxStageBytes} byte whole-page stage budget; reorganize the publication without dropping required constraints`);
+    let stage = stages.at(-1);
+    if (!stage || stage.bytes + bytes > maxStageBytes) {
+      stage = { pageIds: [], bytes: 0 };
+      stages.push(stage);
+    }
+    stage.pageIds.push(page.id);
+    stage.bytes += bytes;
+  }
+  return { knowledge, stages, omitted: pages.filter((page) => !selected.has(page.id)).map((page) => ({ id: page.id, reason: "Outside selected surface and required dependency closure" })) };
+}
+
+// The portable wiki contract uses ordinary Markdown links, not HTML/plugin navigation.
+function withoutFencedCode(content) {
+  let fence;
+  return content.split("\n").map((line) => {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = undefined;
+      return "";
+    }
+    if (marker) {
+      fence = marker[1];
+      return "";
+    }
+    return line;
+  }).join("\n");
+}
+function markdownReferences(content, filename) {
+  const prose = withoutFencedCode(content).replace(/(`+)[^\n]*?\1/g, "");
+  if (/\[\[|<(?:a|img)\b/i.test(prose)) throw new Error(`Unsupported wiki navigation syntax: ${filename}`);
+  const definitions = new Map();
+  const normalize = (value) => value.trim().replace(/\s+/g, " ").toLowerCase();
+  const destination = "(?:<([^<>\\n]*)>|([^\\s<>]+?))(?:\\s+[\"'][^\\n]*[\"'])?";
+  const definition = new RegExp(`^ {0,3}\\[([^\\]\\n]+)\\]:\\s*${destination}\\s*$`, "gm");
+  let body = prose.replace(definition, (_, label, angled, plain) => {
+    const key = normalize(label);
+    if (!definitions.has(key)) definitions.set(key, angled ?? plain);
+    return "";
+  });
+  const links = [];
+  body = body.replace(new RegExp(`!?\\[([^\\]\\n]*)\\]\\(\\s*${destination}\\s*\\)`, "g"), (_, label, angled, plain) => {
+    links.push(angled ?? plain);
+    return "";
+  });
+  body = body.replace(/!?\[([^\]\n]+)\]\[([^\]\n]*)\]/g, (_, label, reference) => {
+    const target = definitions.get(normalize(reference || label));
+    if (target === undefined) throw new Error(`Unresolved Markdown reference: ${filename}: ${reference || label}`);
+    links.push(target);
+    return "";
+  });
+  if (/\]\(/.test(body)) throw new Error(`Malformed Markdown link: ${filename}`);
+  const citations = [];
+  for (const match of body.matchAll(/(?<!\\)\[([^\]\n]+)\]/g)) {
+    const target = definitions.get(normalize(match[1]));
+    if (target !== undefined) links.push(target);
+    else if (!/^[ xX]$/.test(match[1])) citations.push(match[1]);
+  }
+  return { links, citations };
+}
+
+function validateWikiContent(manifest, files) {
+  if (manifest.schemaVersion !== 3) return;
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  const declared = new Set(manifest.files.map((file) => file.path));
+  if (byPath.size !== files.length) throw new Error("Duplicate supplied wiki content path");
+  for (const filename of declared) if (typeof byPath.get(filename)?.content !== "string") throw new Error(`Wiki content file missing: ${filename}`);
+  const pagesByPath = new Map(manifest.knowledge.map((page) => [page.path, page]));
+  const pagesByKey = new Map(manifest.knowledge.filter((page) => page.wiki).map((page) => [page.wiki.pageKey, page]));
+  const resolveLinks = (filename, links) => {
+    const targets = new Set();
+    for (const link of links) {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(link)) {
+        let url;
+        try { url = new URL(link); } catch { throw new Error(`Malformed wiki URL: ${filename}: ${link}`); }
+        if (!["https:", "http:", "mailto:"].includes(url.protocol) || url.username || url.password) throw new Error(`Unsafe wiki URL: ${filename}: ${link}`);
+        continue;
+      }
+      let decoded;
+      try { decoded = decodeURIComponent(link); } catch { throw new Error(`Malformed wiki link encoding: ${filename}: ${link}`); }
+      if (decoded.startsWith("/") || decoded.includes("\\") || /[\u0000-\u001f\u007f?]/.test(decoded)) throw new Error(`Unsafe wiki link: ${filename}: ${link}`);
+      const [relative, fragment, ...extra] = decoded.split("#");
+      const target = relative ? path.posix.normalize(path.posix.join(path.posix.dirname(filename), relative)) : filename;
+      if (extra.length || !artifactPathSchema.safeParse(target).success || !declared.has(target)) throw new Error(`Broken wiki link: ${filename}: ${link}`);
+      if (fragment) {
+        const slugs = new Set();
+        const counts = new Map();
+        for (const heading of withoutFencedCode(byPath.get(target).content).matchAll(/^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/gm)) {
+          const base = heading[1].toLowerCase().replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/<[^>]*>/g, "").replace(/[^\p{L}\p{N}_\-\s]/gu, "").replace(/\s/g, "-");
+          const count = counts.get(base) ?? 0;
+          counts.set(base, count + 1);
+          slugs.add(count ? `${base}-${count}` : base);
+        }
+        if (!slugs.has(fragment)) throw new Error(`Broken wiki anchor: ${filename}: ${link}`);
+      }
+      targets.add(target);
+    }
+    return targets;
+  };
+  for (const page of manifest.knowledge) {
+    const parsed = markdownReferences(byPath.get(page.path).content, page.path);
+    const targets = resolveLinks(page.path, parsed.links);
+    if (page.wiki) for (const citation of parsed.citations) if (!page.citations.includes(citation) || !Object.hasOwn(page.sourceVersions, citation)) throw new Error(`Unknown original citation: ${page.id}: ${citation}`);
+    for (const key of page.wiki?.links ?? []) if (!targets.has(pagesByKey.get(key).path)) throw new Error(`Wiki dependency lacks Markdown navigation: ${page.id}: ${key}`);
+    if (page.wiki) for (const target of targets) {
+      const linked = pagesByPath.get(target);
+      if (linked && !linked.wiki) throw new Error(`Linked knowledge lacks dependency metadata: ${page.id}: ${linked.id}`);
+      if (linked?.wiki && linked.id !== page.id && !(linked.surface === page.surface && linked.wiki.role === "overview") && !page.wiki.links.includes(linked.wiki.pageKey)) throw new Error(`Undeclared wiki dependency: ${page.id}: ${linked.wiki.pageKey}`);
+    }
+  }
+  const index = markdownReferences(byPath.get(manifest.indexPath).content, manifest.indexPath);
+  const indexed = resolveLinks(manifest.indexPath, index.links);
+  for (const page of manifest.knowledge) if (!indexed.has(page.path)) throw new Error(`Wiki index omits page: ${page.id}`);
+  resolveLinks(manifest.conventions.path, markdownReferences(byPath.get(manifest.conventions.path).content, manifest.conventions.path).links);
+}
+/** Structural preview validation only; does not attest Git bytes, semantic support or publication approval. */
+export function validateArtifactWikiContent(manifest, files) {
+  validateWikiContent(artifactManifestSchema.parse(manifest), files);
+}
 export const artifactRevisionSchema = z.object({
   repository: z.string().min(3).max(2000).refine((value) => {
     try { repositoryIdentity(value); return true; } catch { return false; }
@@ -208,6 +463,7 @@ export async function readPublishedArtifacts({ projectDir, revision: expected, l
     if (hash(bytes) !== entry.sha256) throw new Error(`Published file hash differs: ${entry.path}`);
     files.push({ ...entry, content: bytes.toString("utf8") });
   }
+  validateWikiContent(manifest, files);
   await checkout(projectDir, revision, allowances);
   const byPath = new Map(files.map((entry) => [entry.path, entry.content]));
   const artifacts = { manifest, revision, knowledge: manifest.knowledge.map((entry) => ({ ...entry, content: byPath.get(entry.path) })), cases: manifest.cases, files };

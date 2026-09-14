@@ -11,6 +11,14 @@ export interface ArtifactFile {
   kind: "knowledge" | "conventions" | "provenance" | "script" | "fixture" | "test-definition" | "source-snapshot";
   origin: "generated" | "authored";
 }
+export interface WikiPageMetadata {
+  publicationId: string;
+  pageKey: string;
+  role: "overview" | "capability" | "shared";
+  links: string[];
+  /** Deterministic empty-evidence notice; only a sole overview without citations or dependencies. */
+  evidenceStatus?: "withdrawn";
+}
 export interface ArtifactKnowledge {
   id: string;
   title: string;
@@ -21,6 +29,7 @@ export interface ArtifactKnowledge {
   sourceVersions: Record<string, string>;
   gaps: string[];
   history: Array<{ id: string; path: string; updatedAt: string }>;
+  wiki?: WikiPageMetadata;
 }
 export interface ArtifactSourceMetadata {
   id: string;
@@ -59,7 +68,7 @@ export interface ArtifactManifestV2 {
   schemaVersion: 2;
   kind: "aratame-artifacts";
   files: ArtifactFile[];
-  knowledge: ArtifactKnowledge[];
+  knowledge: Array<Omit<ArtifactKnowledge, "wiki">>;
   sources: ArtifactSource[];
   cases: ArtifactCase[];
 }
@@ -68,7 +77,14 @@ export interface ArtifactManifestV1 extends Omit<ArtifactManifestV2, "schemaVers
   sources: LegacyArtifactSource[];
   files: Array<Omit<ArtifactFile, "kind"> & { kind: Exclude<ArtifactFile["kind"], "source-snapshot"> }>;
 }
-export type ArtifactManifest = ArtifactManifestV1 | ArtifactManifestV2;
+export interface ArtifactManifestV3 extends Omit<ArtifactManifestV2, "schemaVersion" | "knowledge"> {
+  schemaVersion: 3;
+  knowledge: ArtifactKnowledge[];
+  publications: Array<{ id: string; surface: string; overviewId: string; pageIds: string[] }>;
+  conventions: { version: 1; path: string };
+  indexPath: string;
+}
+export type ArtifactManifest = ArtifactManifestV1 | ArtifactManifestV2 | ArtifactManifestV3;
 export interface PublishedArtifacts {
   manifest: ArtifactManifest;
   revision: ArtifactRevision;
@@ -79,6 +95,27 @@ export interface PublishedArtifacts {
 export const artifactPathSchema: z.ZodType<string>;
 export const artifactManifestSchema: z.ZodType<ArtifactManifest>;
 export const artifactRevisionSchema: z.ZodType<ArtifactRevision>;
+export const wikiPageMetadataSchema: z.ZodType<WikiPageMetadata>;
+export interface KnowledgeContextPage {
+  id: string;
+  surface: string;
+  wiki?: WikiPageMetadata;
+  content?: string;
+}
+export interface KnowledgeContextOptions {
+  surface?: string;
+  knowledgeIds?: string[];
+  maxStageBytes?: number;
+}
+export interface KnowledgeContextAssembly<T> {
+  knowledge: T[];
+  stages: Array<{ pageIds: string[]; bytes: number }>;
+  omitted: Array<{ id: string; reason: string }>;
+}
+/** Structural dependency closure; does not prove semantic support or grant original/approval authority. */
+export function assembleKnowledgeContext<T extends KnowledgeContextPage>(pages: T[], options?: KnowledgeContextOptions): KnowledgeContextAssembly<T>;
+/** Validates manifest and v3 navigation/citations without reading files or granting Git/evidence authority. */
+export function validateArtifactWikiContent(manifest: ArtifactManifest, files: Array<{ path: string; content: string }>): void;
 export interface CheckoutAllowances {
   /** Exact operator-selected input bytes; never excludes tracked modifications. */
   localFiles?: Array<{ path: string; sha256: string }>;
